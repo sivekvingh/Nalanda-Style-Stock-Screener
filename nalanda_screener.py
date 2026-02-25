@@ -19,10 +19,10 @@ FAITHFUL TO PULAK PRASAD'S ACTUAL PRINCIPLES:
 
 THREE-PHASE ENTRY (Nalanda-style):
   Phase 1 — Quality: ROCE > 20%, Net Debt/EBITDA < 1, FCF/NI > 80%
-  Phase 2 — Buy Limit: price where FCF Yield = 10Y Treasury + 3%
+  Phase 2 — FCF Valuation: FCF Fair Value (Gordon Growth) + FCF Floor (zero-growth backstop)
   Phase 3 — Reverse DCF: Implied growth vs Sustainable growth (ROCE × reinvestment rate)
   Phase 4 — Technical: RSI(14) < 35, Price vs 200d SMA
-  Buy when Quality Pass, Price below Buy Limit (FCF), Implied < Sustainable, RSI < 35.
+  Buy when Quality Pass, Price ≤ FCF Fair Value, Implied Growth < Sustainable, RSI < 35.
 
 SETUP (using uv):
     uv venv .venv
@@ -64,7 +64,7 @@ MASTER_CSV    = os.path.join(OUTPUT_DIR, "nalanda_master.csv")
 SCANNED_FILE  = os.path.join(OUTPUT_DIR, ".scanned_tickers.json")  # tracks ALL scanned (pass+fail)
 DEBUG         = "--debug" in sys.argv
 
-# Three-Phase Nalanda Entry (FCF-yield Buy Limit, Reverse DCF, technical)
+# Three-Phase Nalanda Entry (FCF Fair Value / Floor, Reverse DCF, technical)
 HURDLE_RISK_PREMIUM         = 0.03   # 10Y Treasury + this = hurdle for FCF yield
 REVERSE_DCF_DISCOUNT_RATE    = 0.10
 RSI_OVERSOLD                 = 35
@@ -984,22 +984,52 @@ def nalanda_score(km, rat, prof, hist_roce=None):
         tags.append("Entry Quality Pass")
 
     # ══ THREE-PHASE ENTRY: Phase 2 FCF-yield Buy Limit ═══════════════════════════
+    # Two prices are computed:
+    #   FCF Floor      = FCF / hurdle          (zero-growth anchor; always conservative)
+    #   FCF Fair Value = FCF / (hurdle − g)    (Gordon Growth; g capped at hurdle − 1%
+    #                                           so denominator stays ≥ 1%)
+    # For high-growth companies the Floor is much lower than market — that's expected.
+    # Use Fair Value as the realistic entry target; Floor as the "never pay more than
+    # this even if growth evaporates" backstop.
     ev    = km.get("enterpriseValue") or 0
     fcf_yield = km.get("fcfYield")
     hurdle = (km.get("bondYield10yr") or 0.045) + HURDLE_RISK_PREMIUM
-    details["FCF Yield"] = f"{fcf_yield*100:.1f}%" if fcf_yield is not None else "—"
-    details["Hurdle"] = f"{hurdle*100:.1f}%"
-    buy_limit_fcf = None
-    if fcf and hurdle > 0 and ev is not None:
-        target_ev = fcf / hurdle
-        net_d = km.get("netDebt")
-        if net_d is None:
-            net_d = 0
-        implied_equity = target_ev - net_d
-        shares = km.get("sharesOutstanding") or 0
-        if implied_equity > 0 and shares and shares > 0:
-            buy_limit_fcf = implied_equity / float(shares)
-    details["Buy Limit (FCF)"] = f"${buy_limit_fcf:.2f}" if buy_limit_fcf is not None else "—"
+    net_d  = km.get("netDebt") or 0
+    shares = km.get("sharesOutstanding") or 0
+
+    # --- Sustainable growth (needed for Fair Value; also used in Phase 3) ---
+    b_reinv = None
+    if ni_ttm and ni_ttm > 0 and fcf is not None:
+        b_reinv = max(0.0, min(1.0, 1 - (fcf / float(ni_ttm))))
+    roce_decimal = (roce_ttm / 100.0) if roce_ttm is not None else None
+    g_sust = (roce_decimal * b_reinv) if (roce_decimal is not None and b_reinv is not None) else None
+
+    # --- FCF Floor (zero-growth) ---
+    fcf_floor = None
+    if fcf and hurdle > 0 and shares > 0:
+        floor_equity = (fcf / hurdle) - net_d
+        if floor_equity > 0:
+            fcf_floor = floor_equity / float(shares)
+
+    # --- FCF Fair Value (growth-adjusted via Gordon Growth Model) ---
+    fcf_fair_value = None
+    if fcf and hurdle > 0 and shares > 0:
+        # Cap g at (hurdle − 1%) so denominator is always ≥ 1 pp.
+        # For companies where g_sust ≥ hurdle (hyper-growth), this gives a
+        # high fair value that may still be below market — that's correct:
+        # hyper-growth premia are beyond what a simple single-stage model can
+        # justify; revert to P/E vs history and Reverse DCF in those cases.
+        g_for_gordon = min(g_sust, hurdle - 0.01) if g_sust is not None else 0.0
+        g_for_gordon = max(g_for_gordon, 0.0)           # no negative growth discount
+        spread = hurdle - g_for_gordon                  # ≥ 1%
+        fair_equity = (fcf / spread) - net_d
+        if fair_equity > 0:
+            fcf_fair_value = fair_equity / float(shares)
+
+    details["FCF Yield"]      = f"{fcf_yield*100:.1f}%" if fcf_yield is not None else "—"
+    details["Hurdle"]         = f"{hurdle*100:.1f}%"
+    details["FCF Floor"]      = f"${fcf_floor:.2f}" if fcf_floor is not None else "—"
+    details["FCF Fair Value"] = f"${fcf_fair_value:.2f}" if fcf_fair_value is not None else "—"
 
     # ══ THREE-PHASE ENTRY: Phase 3 Reverse DCF ═══════════════════════════════════
     # When FCF >= NI, reinvestment rate = 0 so sustainable growth = 0; show "—" (N/A)
@@ -1009,23 +1039,16 @@ def nalanda_score(km, rat, prof, hist_roce=None):
     if ev and fcf and (ev + fcf) > 0:
         g_implied = (float(ev) * REVERSE_DCF_DISCOUNT_RATE - float(fcf)) / (float(ev) + float(fcf))
         g_implied = max(-0.5, min(0.5, g_implied))
-    b_reinv = None
-    if ni_ttm and ni_ttm > 0 and fcf is not None:
-        b_reinv = 1 - (fcf / float(ni_ttm))
-        if b_reinv is not None:
-            b_reinv = max(0, min(1, b_reinv))
-    roce_decimal = (roce_ttm / 100.0) if roce_ttm is not None else None
-    g_sust = (roce_decimal * b_reinv) if (roce_decimal is not None and b_reinv is not None) else None
     rev_dcf_signal = "—"
     if g_implied is not None and g_sust is not None:
         if g_sust <= 0:
-            # FCF >= NI (reinvestment rate 0): sustainable-growth comparison not meaningful; high FCF/NI is a quality signal, not a "Not Buy"
+            # FCF >= NI (reinvestment rate 0): sustainable-growth comparison not meaningful
             rev_dcf_signal = "—"
-        elif g_sust > 0:
+        else:
             rev_dcf_signal = "Buy" if g_implied < g_sust else "Not Buy"
-    details["Implied Growth"] = f"{g_implied*100:.1f}%" if g_implied is not None else "—"
-    details["Sustainable Growth"] = f"{g_sust*100:.1f}%" if g_sust is not None else "—"
-    details["Reverse DCF"] = rev_dcf_signal
+    details["Implied Growth"]    = f"{g_implied*100:.1f}%" if g_implied is not None else "—"
+    details["Sustainable Growth"] = f"{g_sust*100:.1f}%"  if g_sust  is not None else "—"
+    details["Reverse DCF"]       = rev_dcf_signal
 
     # ══ THREE-PHASE ENTRY: Phase 4 Technical ═════════════════════════════════════
     rsi14 = prof.get("rsi14")
@@ -1119,7 +1142,7 @@ def write_html(df, path, run_time, n_scanned):
             f"<td style='color:#94a3b8'>{r.Price}</td>"
             f"<td style='color:#6ee7b7;font-size:11px' title='Buy at or below: min(price at bond yield, price at median P/E)'>{rd.get('EntryPrice','—')}</td>"
             f"<td style='color:#94a3b8;font-size:11px' title='Phase 1: ROCE>20%, Net Debt/EBITDA<1, FCF/NI>80%'>{rd.get('QualityPass','—')}</td>"
-            f"<td style='color:#6ee7b7;font-size:11px' title='FCF Yield = 10Y Treasury + 3%'>{rd.get('BuyLimitFCF','—')}</td>"
+            f"<td style='color:#6ee7b7;font-size:11px' title='FCF Fair Value (Gordon Growth, g capped at hurdle-1%)'>{rd.get('FCFFairValue','—')}</td>"
             f"<td style='color:#64748b'>{r.MktCap}</td>"
             f"<td><div style='display:flex;align-items:center;gap:5px'>"
             f"<div style='width:55px;height:4px;background:#1e293b;border-radius:2px;overflow:hidden'>"
@@ -1199,7 +1222,7 @@ td{{padding:7px 10px;border-bottom:1px solid #0a1220;cursor:pointer;vertical-ali
       <th onclick='st(11)'>Price</th>
       <th onclick='st(12)' title='Buy at or below: satisfies both cheapness metrics'>Entry</th>
       <th onclick='st(13)' title='Phase 1 quality filter'>Quality</th>
-      <th onclick='st(14)' title='FCF yield = hurdle'>Buy Limit</th>
+      <th onclick='st(14)' title='FCF Fair Value: FCF÷(hurdle−g), growth-adjusted entry price'>FCF FV</th>
       <th onclick='st(15)'>Mkt Cap</th>
       <th onclick='st(16)'>Score</th><th onclick='st(17)'>Verdict</th><th>Tags</th>
     </tr></thead>
@@ -1310,7 +1333,7 @@ function sd(t){{
   <div style='color:#475569;font-size:10px;margin-bottom:6px'>Entry: buy at or below so P/E &lt; median AND earnings yield &gt; bond yield</div>
 
   <div class='divider'><div class='info-label'>Nalanda Entry (3-Phase)</div></div>
-  <div style='color:#64748b;font-size:10px;margin-bottom:6px'>Buy when Quality Pass, Price below Buy Limit (FCF), Implied Growth &lt; Sustainable, and RSI &lt; 35 near 200d SMA.</div>
+  <div style='color:#64748b;font-size:10px;margin-bottom:6px'>Buy when Quality Pass, Price ≤ FCF Fair Value, Implied Growth &lt; Sustainable, and RSI &lt; 35 near 200d SMA.</div>
   <div class='mg'>
     <div class='mc'><div class='ml'>Quality Pass</div><div class='mv' style='color:${{d.QualityPass==="Y"?"#34d399":"#94a3b8"}}'>${{d.QualityPass||'—'}}</div></div>
     <div class='mc'><div class='ml'>Net Debt/EBITDA</div><div class='mv-sm'>${{d.NetDebtEBITDA||'—'}}</div></div>
@@ -1319,9 +1342,13 @@ function sd(t){{
   <div class='mg'>
     <div class='mc'><div class='ml'>FCF Yield</div><div class='mv-sm'>${{d.FCFYield||'—'}}</div></div>
     <div class='mc'><div class='ml'>Hurdle</div><div class='mv-sm'>${{d.Hurdle||'—'}}</div></div>
-    <div class='mc'><div class='ml'>Buy Limit (FCF)</div><div class='mv' style='color:#6ee7b7'>${{(d.BuyLimitFCF&&d.BuyLimitFCF!=='nan'?d.BuyLimitFCF:'—')}}</div></div>
+  </div>
+  <div class='mg'>
+    <div class='mc'><div class='ml'>FCF Fair Value</div><div class='mv' style='color:#6ee7b7' title='Gordon Growth: FCF÷(hurdle−g). Use as realistic entry target.'>${{(d.FCFFairValue&&d.FCFFairValue!=='nan'?d.FCFFairValue:'—')}}</div></div>
+    <div class='mc'><div class='ml'>FCF Floor</div><div class='mv-sm' title='Zero-growth anchor: FCF÷hurdle. Backstop — never pay more than this if growth stops.'>${{(d.FCFFloor&&d.FCFFloor!=='nan'?d.FCFFloor:'—')}}</div></div>
     <div class='mc'><div class='ml'>Current Price</div><div class='mv-sm'>${{d.Price||'—'}}</div></div>
   </div>
+  <div style='color:#475569;font-size:9px;margin-bottom:4px'>FCF Fair Value uses Gordon Growth (FCF÷(hurdle−g), g capped at hurdle−1%). FCF Floor assumes zero growth — a backstop, not a buy target for growth companies.</div>
   <div class='mg'>
     <div class='mc'><div class='ml'>Implied Growth</div><div class='mv-sm'>${{d.ImpliedGrowth||'—'}}</div></div>
     <div class='mc'><div class='ml'>Sustainable Growth</div><div class='mv-sm'>${{d.SustGrowth||'—'}}</div></div>
@@ -1416,10 +1443,11 @@ def run_entry(ticker):
     print(f"    Quality Pass:   {det.get('Quality Pass','—')}")
     print(f"    Net Debt/EBITDA: {det.get('Net Debt/EBITDA','—')}")
     print(f"    FCF/NI:         {det.get('FCF/NI','—')}")
-    print(f"  {Fore.CYAN}Phase 2: FCF-yield Buy Limit{Style.RESET_ALL}")
+    print(f"  {Fore.CYAN}Phase 2: FCF Valuation{Style.RESET_ALL}")
     print(f"    FCF Yield:      {det.get('FCF Yield','—')}")
     print(f"    Hurdle:         {det.get('Hurdle','—')}")
-    print(f"    Buy Limit (FCF): {det.get('Buy Limit (FCF)','—')}")
+    print(f"    FCF Fair Value: {det.get('FCF Fair Value','—')}  ← realistic entry (Gordon Growth)")
+    print(f"    FCF Floor:      {det.get('FCF Floor','—')}  ← backstop if growth evaporates")
     print(f"    Current Price:  ${prof.get('price', 0):.2f}")
     print(f"  {Fore.CYAN}Phase 3: Reverse DCF{Style.RESET_ALL}")
     print(f"    Implied Growth:   {det.get('Implied Growth','—')}")
@@ -1431,7 +1459,7 @@ def run_entry(ticker):
     print(f"    Price vs SMA:   {det.get('Price vs 200d SMA','—')}")
     print(f"    Technical:      {det.get('Technical','—')}")
     print(f"\n  Current price: ${prof.get('price', 0):.2f}")
-    print(f"  Execute when RSI < 35 near Buy Limit price.\n")
+    print(f"  Execute when RSI < 35 and price approaches FCF Fair Value.\n")
 
 
 # ── MAIN ──────────────────────────────────────────────────────────────────────
@@ -1551,7 +1579,8 @@ def main():
             "FCFtoNI":     det.get("FCF/NI", "—"),
             "FCFYield":    det.get("FCF Yield", "—"),
             "Hurdle":      det.get("Hurdle", "—"),
-            "BuyLimitFCF": det.get("Buy Limit (FCF)", "—"),
+            "FCFFloor":    det.get("FCF Floor", "—"),
+            "FCFFairValue": det.get("FCF Fair Value", "—"),
             "ImpliedGrowth": det.get("Implied Growth", "—"),
             "SustGrowth":  det.get("Sustainable Growth", "—"),
             "ReverseDCF":  det.get("Reverse DCF", "—"),
