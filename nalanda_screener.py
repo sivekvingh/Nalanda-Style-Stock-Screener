@@ -555,14 +555,26 @@ def _calc_hist_ev_fcf_median(t, info):
             hist[hist.index.month == fy_end_month].index.year).last()
 
         # --- Compute EV/FCF per year ---
+        def _safe_float(val, default=0.0):
+            """Convert to float, treating None/NaN as default (e.g. net-cash companies
+            often have NaN debt rows rather than 0)."""
+            import math
+            if val is None:
+                return default
+            try:
+                f = float(val)
+                return default if math.isnan(f) else f
+            except (TypeError, ValueError):
+                return default
+
         ratios = []
         for col in fcf_row.index:
             yr   = col.year
-            fcf_val = float(fcf_row[col])
-            if fcf_val <= 0:                     # ignore years with negative FCF
+            fcf_val = _safe_float(fcf_row.get(col))
+            if fcf_val <= 0:                     # ignore years with negative/missing FCF
                 continue
-            debt_val = float(debt_row.get(col, 0) or 0)
-            cash_val = float(cash_row.get(col, 0) or 0)
+            debt_val = _safe_float(debt_row.get(col, 0))  # NaN → 0 (net-cash companies)
+            cash_val = _safe_float(cash_row.get(col, 0))
 
             # Shares: find nearest quarterly figure for this fiscal year
             if shares_series is not None:
@@ -1141,19 +1153,25 @@ def nalanda_score(km, rat, prof, hist_roce=None):
     fcf_fair_value      = None
     fcf_fair_value_method = None
 
-    fcf_gt_ni = (ni_ttm is not None and ni_ttm > 0 and fcf is not None and fcf > ni_ttm)
+    # Use EV/FCF multiple reversion when FCF/NI > 0.90 (reinvestment rate < 10%).
+    # Below this threshold the Gordon model's g_sust is so small (< ~2%) that
+    # Fair Value ≈ Floor and the growth component is meaningless.
+    # Examples: ANET (0.96x), V (1.07x), MA (1.09x), ADBE (1.24x) all fall here.
+    FCF_NI_GORDON_THRESHOLD = 0.90
+    fcf_ni_ratio = (fcf / float(ni_ttm)) if (ni_ttm and ni_ttm > 0 and fcf) else None
+    use_ev_fcf_reversion = (fcf_ni_ratio is not None and fcf_ni_ratio > FCF_NI_GORDON_THRESHOLD)
 
     if fcf and shares > 0:
-        if not fcf_gt_ni and g_sust is not None and g_sust > 0 and hurdle > 0:
-            # Gordon Growth Model (FCF < NI)
+        if not use_ev_fcf_reversion and g_sust is not None and g_sust > 0 and hurdle > 0:
+            # Gordon Growth Model (FCF/NI ≤ 0.90 — meaningful reinvestment)
             g_for_gordon = min(g_sust, hurdle - 0.01)
             spread = hurdle - g_for_gordon                    # ≥ 1 pp
             fair_equity = (fcf / spread) - net_d
             if fair_equity > 0:
                 fcf_fair_value = fair_equity / float(shares)
                 fcf_fair_value_method = "Gordon"
-        elif fcf_gt_ni:
-            # EV/FCF multiple reversion (FCF >= NI)
+        elif use_ev_fcf_reversion:
+            # EV/FCF multiple reversion (FCF/NI > 0.90 — reinvestment < 10%)
             hist_ev_fcf = km.get("histEvFcfMedian")
             hist_ev_fcf_yrs = km.get("histEvFcfYears") or 0
             if hist_ev_fcf and hist_ev_fcf > 0 and hist_ev_fcf_yrs >= 2:
