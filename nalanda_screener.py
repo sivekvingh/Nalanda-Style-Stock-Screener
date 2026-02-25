@@ -483,6 +483,119 @@ def _calc_hist_pe_median(t, info):
         return None
 
 
+def _calc_hist_ev_fcf_median(t, info):
+    """
+    Compute median historical EV/FCF using annual balance sheet, cash flow, and
+    year-end stock prices.  Used as a fair-multiple anchor for FCF > NI companies
+    where the Gordon Growth reinvestment model breaks down.
+
+    For each fiscal year with available data:
+      FCF  = Operating Cash Flow − CapEx   (from cashflow statement)
+      debt = Total Debt                    (from balance sheet)
+      cash = Cash & equivalents            (from balance sheet)
+      shares = Ordinary Shares Number      (from quarterly balance sheet)
+      price  = closing price at fiscal year-end month
+      EV   = price × shares + debt − cash
+      EV/FCF ratio computed per year
+
+    Returns (median_ev_fcf, n_years) or (None, 0) if insufficient data.
+    """
+    try:
+        cf  = t.cashflow
+        bs  = t.balance_sheet
+        qbs = t.quarterly_balance_sheet
+
+        if cf is None or cf.empty or bs is None or bs.empty:
+            return None, 0
+
+        # --- FCF per fiscal year ---
+        fcf_row = None
+        if "Free Cash Flow" in cf.index:
+            fcf_row = cf.loc["Free Cash Flow"].dropna()
+        else:
+            ocf_row  = None
+            capex_row = None
+            for n in ["Operating Cash Flow", "Cash Flow From Operations"]:
+                if n in cf.index: ocf_row = cf.loc[n].dropna(); break
+            for n in ["Capital Expenditure", "Capital Expenditures"]:
+                if n in cf.index: capex_row = cf.loc[n].dropna(); break
+            if ocf_row is not None and capex_row is not None:
+                fcf_row = ocf_row + capex_row   # capex is negative in yfinance
+        if fcf_row is None or len(fcf_row) < 2:
+            return None, 0
+
+        # --- Debt and cash per fiscal year ---
+        debt_row = cash_row = None
+        for n in ["Total Debt", "Short Long Term Debt"]:
+            if n in bs.index: debt_row = bs.loc[n]; break
+        for n in ["Cash Cash Equivalents And Short Term Investments",
+                  "Cash And Cash Equivalents", "Cash"]:
+            if n in bs.index: cash_row = bs.loc[n]; break
+        if debt_row is None or cash_row is None:
+            return None, 0
+
+        # --- Historical shares: prefer quarterly balance sheet for accuracy ---
+        shares_series = None
+        if qbs is not None and not qbs.empty:
+            for n in ["Ordinary Shares Number", "Share Issued", "Common Stock"]:
+                if n in qbs.index:
+                    shares_series = qbs.loc[n].dropna()
+                    break
+        fallback_shares = (info.get("sharesOutstanding") or
+                           info.get("impliedSharesOutstanding") or 0)
+
+        # --- Year-end prices: use fiscal year-end month ---
+        # Determine fiscal year-end month from first cashflow column
+        fy_end_month = fcf_row.index[0].month
+        hist = t.history(period="10y", interval="1mo")
+        if hist is None or hist.empty:
+            return None, 0
+        # Pick the last trading price in each fiscal year-end month
+        fy_prices = hist[hist.index.month == fy_end_month]["Close"].groupby(
+            hist[hist.index.month == fy_end_month].index.year).last()
+
+        # --- Compute EV/FCF per year ---
+        ratios = []
+        for col in fcf_row.index:
+            yr   = col.year
+            fcf_val = float(fcf_row[col])
+            if fcf_val <= 0:                     # ignore years with negative FCF
+                continue
+            debt_val = float(debt_row.get(col, 0) or 0)
+            cash_val = float(cash_row.get(col, 0) or 0)
+
+            # Shares: find nearest quarterly figure for this fiscal year
+            if shares_series is not None:
+                yr_shares = shares_series[shares_series.index.year == yr]
+                shr = float(yr_shares.iloc[-1]) if not yr_shares.empty else fallback_shares
+            else:
+                shr = fallback_shares
+            if not shr or shr <= 0:
+                continue
+
+            price_val = fy_prices.get(yr)
+            if price_val is None or float(price_val) <= 0:
+                continue
+            price_val = float(price_val)
+
+            mkt_cap = price_val * shr
+            ev_val  = mkt_cap + debt_val - cash_val
+            if ev_val <= 0:
+                continue
+            ratio = ev_val / fcf_val
+            if 1 < ratio < 200:               # sanity bounds
+                ratios.append(ratio)
+
+        if len(ratios) < 2:
+            return None, 0
+        ratios.sort()
+        median = ratios[len(ratios) // 2]
+        return round(median, 1), len(ratios)
+
+    except Exception:
+        return None, 0
+
+
 def _calc_technical(t, price):
     """
     RSI(14) and 200-day SMA from daily history. Used for Phase 4 entry checklist.
@@ -587,6 +700,7 @@ def get_yf_data(ticker):
         cfo_quality         = _calc_cfo_quality(t)
         hist_pe_median      = _calc_hist_pe_median(t, info)
         bond_yield          = _fetch_bond_yield()
+        hist_ev_fcf_median, hist_ev_fcf_years = _calc_hist_ev_fcf_median(t, info)
 
         km = {
             "returnOnCapitalEmployedTTM": roce_ttm,
@@ -607,8 +721,10 @@ def get_yf_data(ticker):
             "earningsCagr":               earn_cagr,   # decimal or None
             "cfoQualityRatio":            cfo_quality, # decimal or None
             # Valuation (new v8)
-            "histPeMedian":               hist_pe_median,  # float or None
-            "bondYield10yr":              bond_yield,  # decimal (e.g. 0.043)
+            "histPeMedian":               hist_pe_median,     # float or None
+            "bondYield10yr":              bond_yield,         # decimal (e.g. 0.043)
+            "histEvFcfMedian":            hist_ev_fcf_median, # float or None
+            "histEvFcfYears":             hist_ev_fcf_years,  # int
             # Data quality
             "filingDate":                 filing_date,
             "dataAgeMonths":              data_age_months,
@@ -1011,25 +1127,49 @@ def nalanda_score(km, rat, prof, hist_roce=None):
         if floor_equity > 0:
             fcf_floor = floor_equity / float(shares)
 
-    # --- FCF Fair Value (growth-adjusted via Gordon Growth Model) ---
-    fcf_fair_value = None
-    if fcf and hurdle > 0 and shares > 0:
-        # Cap g at (hurdle − 1%) so denominator is always ≥ 1 pp.
-        # For companies where g_sust ≥ hurdle (hyper-growth), this gives a
-        # high fair value that may still be below market — that's correct:
-        # hyper-growth premia are beyond what a simple single-stage model can
-        # justify; revert to P/E vs history and Reverse DCF in those cases.
-        g_for_gordon = min(g_sust, hurdle - 0.01) if g_sust is not None else 0.0
-        g_for_gordon = max(g_for_gordon, 0.0)           # no negative growth discount
-        spread = hurdle - g_for_gordon                  # ≥ 1%
-        fair_equity = (fcf / spread) - net_d
-        if fair_equity > 0:
-            fcf_fair_value = fair_equity / float(shares)
+    # --- FCF Fair Value ---
+    # Two regimes depending on whether FCF < NI or FCF >= NI:
+    #
+    # FCF < NI  → company reinvests earnings → use Gordon Growth Model
+    #             Fair Value = FCF / (hurdle − g_sust), g capped at hurdle−1%
+    #
+    # FCF >= NI → reinvestment rate = 0, Gordon model breaks down.
+    #             Use EV/FCF multiple reversion instead:
+    #             Fair Value = (FCF × hist_median_EV_FCF − net_debt) / shares
+    #             If no historical median is available, leave as "—" and rely
+    #             on P/E vs history and FCF yield vs hurdle.
+    fcf_fair_value      = None
+    fcf_fair_value_method = None
+
+    fcf_gt_ni = (ni_ttm is not None and ni_ttm > 0 and fcf is not None and fcf > ni_ttm)
+
+    if fcf and shares > 0:
+        if not fcf_gt_ni and g_sust is not None and g_sust > 0 and hurdle > 0:
+            # Gordon Growth Model (FCF < NI)
+            g_for_gordon = min(g_sust, hurdle - 0.01)
+            spread = hurdle - g_for_gordon                    # ≥ 1 pp
+            fair_equity = (fcf / spread) - net_d
+            if fair_equity > 0:
+                fcf_fair_value = fair_equity / float(shares)
+                fcf_fair_value_method = "Gordon"
+        elif fcf_gt_ni:
+            # EV/FCF multiple reversion (FCF >= NI)
+            hist_ev_fcf = km.get("histEvFcfMedian")
+            hist_ev_fcf_yrs = km.get("histEvFcfYears") or 0
+            if hist_ev_fcf and hist_ev_fcf > 0 and hist_ev_fcf_yrs >= 2:
+                fair_equity = (fcf * hist_ev_fcf) - net_d
+                if fair_equity > 0:
+                    fcf_fair_value = fair_equity / float(shares)
+                    fcf_fair_value_method = f"EV/FCF {hist_ev_fcf:.0f}× median ({hist_ev_fcf_yrs}yr)"
 
     details["FCF Yield"]      = f"{fcf_yield*100:.1f}%" if fcf_yield is not None else "—"
     details["Hurdle"]         = f"{hurdle*100:.1f}%"
     details["FCF Floor"]      = f"${fcf_floor:.2f}" if fcf_floor is not None else "—"
-    details["FCF Fair Value"] = f"${fcf_fair_value:.2f}" if fcf_fair_value is not None else "—"
+    details["FCF Fair Value"] = (
+        f"${fcf_fair_value:.2f} ({fcf_fair_value_method})"
+        if fcf_fair_value is not None else "—"
+    )
+    details["FCF FV Method"]  = fcf_fair_value_method or "—"
 
     # ══ THREE-PHASE ENTRY: Phase 3 Reverse DCF ═══════════════════════════════════
     # When FCF >= NI, reinvestment rate = 0 so sustainable growth = 0; show "—" (N/A)
@@ -1142,7 +1282,7 @@ def write_html(df, path, run_time, n_scanned):
             f"<td style='color:#94a3b8'>{r.Price}</td>"
             f"<td style='color:#6ee7b7;font-size:11px' title='Buy at or below: min(price at bond yield, price at median P/E)'>{rd.get('EntryPrice','—')}</td>"
             f"<td style='color:#94a3b8;font-size:11px' title='Phase 1: ROCE>20%, Net Debt/EBITDA<1, FCF/NI>80%'>{rd.get('QualityPass','—')}</td>"
-            f"<td style='color:#6ee7b7;font-size:11px' title='FCF Fair Value (Gordon Growth, g capped at hurdle-1%)'>{rd.get('FCFFairValue','—')}</td>"
+            f"<td style='color:#6ee7b7;font-size:11px' title='FCF Fair Value — Gordon Growth (FCF&lt;NI) or EV/FCF median reversion (FCF≥NI)'>{rd.get('FCFFairValue','—')}</td>"
             f"<td style='color:#64748b'>{r.MktCap}</td>"
             f"<td><div style='display:flex;align-items:center;gap:5px'>"
             f"<div style='width:55px;height:4px;background:#1e293b;border-radius:2px;overflow:hidden'>"
@@ -1222,7 +1362,7 @@ td{{padding:7px 10px;border-bottom:1px solid #0a1220;cursor:pointer;vertical-ali
       <th onclick='st(11)'>Price</th>
       <th onclick='st(12)' title='Buy at or below: satisfies both cheapness metrics'>Entry</th>
       <th onclick='st(13)' title='Phase 1 quality filter'>Quality</th>
-      <th onclick='st(14)' title='FCF Fair Value: FCF÷(hurdle−g), growth-adjusted entry price'>FCF FV</th>
+      <th onclick='st(14)' title='FCF Fair Value: Gordon Growth if FCF&lt;NI, else EV/FCF median reversion'>FCF FV</th>
       <th onclick='st(15)'>Mkt Cap</th>
       <th onclick='st(16)'>Score</th><th onclick='st(17)'>Verdict</th><th>Tags</th>
     </tr></thead>
@@ -1348,7 +1488,7 @@ function sd(t){{
     <div class='mc'><div class='ml'>FCF Floor</div><div class='mv-sm' title='Zero-growth anchor: FCF÷hurdle. Backstop — never pay more than this if growth stops.'>${{(d.FCFFloor&&d.FCFFloor!=='nan'?d.FCFFloor:'—')}}</div></div>
     <div class='mc'><div class='ml'>Current Price</div><div class='mv-sm'>${{d.Price||'—'}}</div></div>
   </div>
-  <div style='color:#475569;font-size:9px;margin-bottom:4px'>FCF Fair Value uses Gordon Growth (FCF÷(hurdle−g), g capped at hurdle−1%). FCF Floor assumes zero growth — a backstop, not a buy target for growth companies.</div>
+  <div style='color:#475569;font-size:9px;margin-bottom:4px'>FCF Fair Value: if FCF &lt; NI → Gordon Growth FCF÷(hurdle−g); if FCF ≥ NI → EV/FCF multiple reversion at historical median. Method shown in parentheses. FCF Floor = zero-growth backstop.</div>
   <div class='mg'>
     <div class='mc'><div class='ml'>Implied Growth</div><div class='mv-sm'>${{d.ImpliedGrowth||'—'}}</div></div>
     <div class='mc'><div class='ml'>Sustainable Growth</div><div class='mv-sm'>${{d.SustGrowth||'—'}}</div></div>
@@ -1446,7 +1586,7 @@ def run_entry(ticker):
     print(f"  {Fore.CYAN}Phase 2: FCF Valuation{Style.RESET_ALL}")
     print(f"    FCF Yield:      {det.get('FCF Yield','—')}")
     print(f"    Hurdle:         {det.get('Hurdle','—')}")
-    print(f"    FCF Fair Value: {det.get('FCF Fair Value','—')}  ← realistic entry (Gordon Growth)")
+    print(f"    FCF Fair Value: {det.get('FCF Fair Value','—')}  ← realistic entry")
     print(f"    FCF Floor:      {det.get('FCF Floor','—')}  ← backstop if growth evaporates")
     print(f"    Current Price:  ${prof.get('price', 0):.2f}")
     print(f"  {Fore.CYAN}Phase 3: Reverse DCF{Style.RESET_ALL}")
