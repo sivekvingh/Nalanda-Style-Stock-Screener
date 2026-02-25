@@ -1161,31 +1161,81 @@ def nalanda_score(km, rat, prof, hist_roce=None):
     fcf_ni_ratio = (fcf / float(ni_ttm)) if (ni_ttm and ni_ttm > 0 and fcf) else None
     use_ev_fcf_reversion = (fcf_ni_ratio is not None and fcf_ni_ratio > FCF_NI_GORDON_THRESHOLD)
 
+    # Storage for both endpoints
+    fcf_fv_low = fcf_fv_high = None          # price per share
+    fcf_fv_mult_low = fcf_fv_mult_high = None  # implied EV/FCF multiple
+    fcf_fair_value = fcf_fair_value_method = None   # kept for backwards compat
+
     if fcf and shares > 0:
         if not use_ev_fcf_reversion and g_sust is not None and g_sust > 0 and hurdle > 0:
-            # Gordon Growth Model (FCF/NI ≤ 0.90 — meaningful reinvestment)
-            g_for_gordon = min(g_sust, hurdle - 0.01)
-            spread = hurdle - g_for_gordon                    # ≥ 1 pp
-            fair_equity = (fcf / spread) - net_d
-            if fair_equity > 0:
-                fcf_fair_value = fair_equity / float(shares)
+            # ── Gordon Growth — two growth assumptions give a range ──────────────
+            # Conservative: g = min(g_sust, hurdle − 3%)   spread ≥ 3 pp
+            # Optimistic:   g = min(g_sust, hurdle − 1%)   spread ≥ 1 pp
+            # The range makes the model's sensitivity to g visible.
+            g_low  = min(g_sust, hurdle - 0.03)   # conservative cap
+            g_low  = max(g_low, 0.0)
+            g_high = min(g_sust, hurdle - 0.01)   # optimistic cap
+
+            for g_val, attr in [(g_low, "low"), (g_high, "high")]:
+                spread = hurdle - g_val
+                eq = (fcf / spread) - net_d
+                if eq > 0:
+                    price = eq / float(shares)
+                    mult  = min((price * float(shares) + net_d) / fcf, 80.0)  # cap display at 80×
+                    if attr == "low":
+                        fcf_fv_low, fcf_fv_mult_low = price, mult
+                    else:
+                        fcf_fv_high, fcf_fv_mult_high = price, mult
+
+            # Use optimistic as the headline "fair value" (consistent with old behaviour)
+            if fcf_fv_high is not None:
+                fcf_fair_value = fcf_fv_high
                 fcf_fair_value_method = "Gordon"
+
         elif use_ev_fcf_reversion:
-            # EV/FCF multiple reversion (FCF/NI > 0.90 — reinvestment < 10%)
+            # ── EV/FCF multiple reversion (FCF/NI > 0.90) ───────────────────────
+            # Conservative: 20th-percentile of historical range (median − 20%)
+            # Optimistic:   median
             hist_ev_fcf = km.get("histEvFcfMedian")
             hist_ev_fcf_yrs = km.get("histEvFcfYears") or 0
             if hist_ev_fcf and hist_ev_fcf > 0 and hist_ev_fcf_yrs >= 2:
-                fair_equity = (fcf * hist_ev_fcf) - net_d
-                if fair_equity > 0:
-                    fcf_fair_value = fair_equity / float(shares)
-                    fcf_fair_value_method = f"EV/FCF {hist_ev_fcf:.0f}× median ({hist_ev_fcf_yrs}yr)"
+                mult_high = hist_ev_fcf
+                mult_low  = hist_ev_fcf * 0.80      # 20% haircut = conservative
+
+                for mult, attr in [(mult_low, "low"), (mult_high, "high")]:
+                    eq = (fcf * mult) - net_d
+                    if eq > 0:
+                        price = eq / float(shares)
+                        if attr == "low":
+                            fcf_fv_low, fcf_fv_mult_low = price, mult
+                        else:
+                            fcf_fv_high, fcf_fv_mult_high = price, mult
+
+                if fcf_fv_high is not None:
+                    fcf_fair_value = fcf_fv_high
+                    fcf_fair_value_method = (
+                        f"EV/FCF {hist_ev_fcf:.0f}× median ({hist_ev_fcf_yrs}yr)"
+                    )
+
+    # ── Format detail strings ─────────────────────────────────────────────────
+    def _fv_range_str(lo, hi, mult_lo, mult_hi):
+        if lo is not None and hi is not None:
+            return (
+                f"${lo:.0f} – ${hi:.0f}  "
+                f"({mult_lo:.0f}× – {mult_hi:.0f}× FCF)"
+            )
+        if hi is not None:
+            return f"${hi:.0f}  ({mult_hi:.0f}× FCF)"
+        return "—"
 
     details["FCF Yield"]      = f"{fcf_yield*100:.1f}%" if fcf_yield is not None else "—"
     details["Hurdle"]         = f"{hurdle*100:.1f}%"
-    details["FCF Floor"]      = f"${fcf_floor:.2f}" if fcf_floor is not None else "—"
-    details["FCF Fair Value"] = (
-        f"${fcf_fair_value:.2f} ({fcf_fair_value_method})"
-        if fcf_fair_value is not None else "—"
+    details["FCF Floor"]      = (
+        f"${fcf_floor:.0f}  ({(fcf_floor * float(shares) + net_d) / fcf:.0f}× FCF)"
+        if fcf_floor is not None and fcf else "—"
+    )
+    details["FCF Fair Value"] = _fv_range_str(
+        fcf_fv_low, fcf_fv_high, fcf_fv_mult_low, fcf_fv_mult_high
     )
     details["FCF FV Method"]  = fcf_fair_value_method or "—"
 
@@ -1604,7 +1654,8 @@ def run_entry(ticker):
     print(f"  {Fore.CYAN}Phase 2: FCF Valuation{Style.RESET_ALL}")
     print(f"    FCF Yield:      {det.get('FCF Yield','—')}")
     print(f"    Hurdle:         {det.get('Hurdle','—')}")
-    print(f"    FCF Fair Value: {det.get('FCF Fair Value','—')}  ← realistic entry")
+    print(f"    FCF Fair Value: {det.get('FCF Fair Value','—')}")
+    print(f"      Method:       {det.get('FCF FV Method','—')}")
     print(f"    FCF Floor:      {det.get('FCF Floor','—')}  ← backstop if growth evaporates")
     print(f"    Current Price:  ${prof.get('price', 0):.2f}")
     print(f"  {Fore.CYAN}Phase 3: Reverse DCF{Style.RESET_ALL}")
