@@ -935,11 +935,51 @@ def nalanda_score(km, rat, prof, hist_roce=None):
     nd_ebitda  = km.get("netDebtToEbitda")
     quality_roce   = roce_ttm >= QUALITY_ROCE_MIN
     quality_debt   = (net_debt is not None and ebitda is not None and ebitda > 0 and (net_debt / ebitda) < QUALITY_NET_DEBT_EBITDA_MAX) or (net_debt is not None and net_debt <= 0) or (ebitda is None or ebitda <= 0)
-    quality_fcf_ni = (fcf_ni is not None and fcf_ni >= QUALITY_FCF_NI_MIN) if (ni_ttm and ni_ttm > 0) else None  # None = N/A
+
+    # FCF/NI quality: Option B — only fail when BOTH (a) FCF/NI is below threshold
+    # AND (b) ROCE is declining, which suggests inflated earnings not accruals.
+    # If FCF/NI is low but ROCE is stable/high, treat as "Reinvesting" (capex), not a fail.
+    fcf_ni_note = ""
+    if ni_ttm is None or ni_ttm <= 0 or fcf_ni is None:
+        quality_fcf_ni = None                # N/A — can't judge
+    elif fcf_ni < 0:
+        quality_fcf_ni = False               # FCF negative: fail unconditionally
+        fcf_ni_note = " ⚠ neg FCF"
+    elif fcf_ni >= QUALITY_FCF_NI_MIN:
+        quality_fcf_ni = True                # clean pass
+    else:
+        # 0 ≤ FCF/NI < 80%: distinguish "accruals risk" from "heavy capex reinvestment".
+        # Real accruals risk requires BOTH declining ROCE AND recent ROCE falling below
+        # the quality bar (≥ 20%).  A company like MSFT with ROCE at 30% that dipped
+        # from 35% is reinvesting in AI/cloud — not manipulating earnings.
+        # Rule: only flag accruals if ROCE has actually decayed into marginal territory
+        # (< QUALITY_ROCE_MIN * 1.25 = 25%) while also showing a declining trend.
+        roce_declining = False
+        if hist_roce and len(hist_roce) >= 3:
+            fy_vals = [r for yr, r in hist_roce if yr != "TTM"]
+            if len(fy_vals) >= 2:
+                # hist_roce is newest-first; fy_vals[0] = most recent FY
+                recent_roce = fy_vals[0]
+                oldest_roce = fy_vals[-1]
+                # Declining AND drifting into marginal ROCE territory.
+                # hist_roce values are raw decimals (e.g. 0.27 = 27%),
+                # so convert the % threshold to decimal before comparing.
+                roce_min_decimal = QUALITY_ROCE_MIN / 100        # 20% → 0.20
+                roce_declining = (
+                    oldest_roce > recent_roce * 1.10
+                    and recent_roce < roce_min_decimal * 1.25    # below 25% in decimal
+                )
+        if roce_declining:
+            quality_fcf_ni = False           # marginal ROCE + low FCF/NI = accruals risk
+            fcf_ni_note = " ⚠ accruals?"
+        else:
+            quality_fcf_ni = True            # strong ROCE + low FCF/NI = reinvesting
+            fcf_ni_note = " (reinvesting)"
+
     quality_pass   = quality_roce and quality_debt and (quality_fcf_ni is not False)
     details["Quality Pass"] = "Y" if quality_pass else "N"
     details["Net Debt/EBITDA"] = f"{nd_ebitda:.2f}x" if nd_ebitda is not None else "—"
-    details["FCF/NI"] = f"{fcf_ni:.2f}x" if fcf_ni is not None else "—"
+    details["FCF/NI"] = (f"{fcf_ni:.2f}x{fcf_ni_note}" if fcf_ni is not None else "—")
     if quality_pass:
         tags.append("Entry Quality Pass")
 
