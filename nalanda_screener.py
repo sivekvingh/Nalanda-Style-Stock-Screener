@@ -24,9 +24,17 @@ THREE-PHASE ENTRY (Nalanda-style):
   Phase 4 — Technical: RSI(14) < 35, Price vs 200d SMA
   Buy when Quality Pass, Price ≤ FCF Fair Value, Implied Growth < Sustainable, RSI < 35.
 
+SCAN UNIVERSE (v8.1):
+  The real S&P Composite 1500 — reconstructed as the union of Wikipedia's
+  three dedicated S&P index-membership pages: List of S&P 500 companies,
+  List of S&P 400 companies, List of S&P 600 companies. This is NOT the
+  same as the S&P Total Market Index (SPTM/ITOT, ~2,500-3,500 names) —
+  that's a broader, looser-screened universe. Summing the three sub-index
+  lists is the accurate way to reconstruct the actual 1,500-name Composite.
+
 SETUP (using uv):
     uv venv .venv
-    uv pip install --python .venv/bin/python yfinance pandas tabulate colorama
+    uv pip install --python .venv/bin/python yfinance pandas tabulate colorama lxml requests
     source .venv/bin/activate
 
 RUN:
@@ -42,7 +50,9 @@ DEBUG (shows raw yfinance fields for one ticker):
 
 import yfinance as yf
 import pandas as pd
-import time, os, sys, json
+import numpy as np
+import time, os, sys, json, threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime
 
 try:
@@ -58,7 +68,16 @@ except ImportError:
 
 # ── CONFIG ────────────────────────────────────────────────────────────────────
 PAUSE      = 0.6
-MAX_STOCKS = None       # None = scan all S&P 500 in one run
+MAX_STOCKS = None       # None = scan full union universe in one run
+# yfinance throttles aggressively — many parallel threads trigger 429s.
+# NALANDA_WORKERS: thread pool size (tasks queue here).
+# NALANDA_YF_CONCURRENCY: max simultaneous Yahoo-bound sections (default 2).
+# Override either if you still hit rate limits.
+MAX_WORKERS = max(1, int(os.getenv("NALANDA_WORKERS", str(min(4, os.cpu_count() or 1)))))
+YF_MAX_RETRIES = max(1, int(os.getenv("NALANDA_YF_RETRIES", "6")))
+YF_RETRY_BASE_SEC = float(os.getenv("NALANDA_YF_RETRY_BASE", "3"))
+YF_CONCURRENCY = max(1, int(os.getenv("NALANDA_YF_CONCURRENCY", "2")))
+_YF_SEM = threading.BoundedSemaphore(YF_CONCURRENCY)
 OUTPUT_DIR = "."
 MASTER_CSV    = os.path.join(OUTPUT_DIR, "nalanda_master.csv")
 SCANNED_FILE  = os.path.join(OUTPUT_DIR, ".scanned_tickers.json")  # tracks ALL scanned (pass+fail)
@@ -103,62 +122,119 @@ CONGLOMERATE_KEYWORDS = [
     "conglomerate", "diversified", "multi-sector", "holding company"
 ]
 
-# ── S&P 500 TICKERS — fetched live from Wikipedia ────────────────────────────
-_SP500_CACHE_FILE = os.path.join(OUTPUT_DIR, ".sp500_cache.json")
-_SP500_CACHE_DAYS = 7   # refresh the list at most once a week
+# ── SCAN UNIVERSE: S&P Composite 1500 (Wikipedia 500 + 400 + 600 union) ───────
+# Real S&P 1500, reconstructed from Wikipedia's three dedicated index-
+# membership pages (List_of_S%26P_500/400/600_companies). These are actively
+# maintained — the S&P 500 page's changelog was current to within days of
+# S&P DJI's own rebalance press releases when checked. This replaces an
+# earlier iShares-holdings-CSV approach that broke: iShares' .ajax export
+# endpoint started returning their JS-rendered product page instead of the
+# raw CSV (likely a backend/SPA change on their end), making it undownloadable
+# via a plain script request.
+def _normalize_yf_ticker(sym):
+    """Index/holdings lists use BRK.B; yfinance expects BRK-B."""
+    if sym is None or (isinstance(sym, float) and pd.isna(sym)):
+        return ""
+    s = str(sym).strip().upper()
+    if not s or s == "NAN":
+        return ""
+    return s.replace(".", "-")
 
-def get_sp500_tickers():
+
+_SP1500_CACHE_FILE = os.path.join(OUTPUT_DIR, ".sp1500_cache.json")
+_SP1500_CACHE_DAYS = 7   # refresh the list at most once a week
+
+_WIKI_SP_INDEX_PAGES = {
+    "SP500": "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies",
+    "SP400": "https://en.wikipedia.org/wiki/List_of_S%26P_400_companies",
+    "SP600": "https://en.wikipedia.org/wiki/List_of_S%26P_600_companies",
+}
+
+
+def _fetch_wiki_sp_index(name, url):
     """
-    Fetch the current S&P 500 constituent list from Wikipedia.
-    Caches the result for up to _SP500_CACHE_DAYS days so we don't
-    hit Wikipedia on every run.
-
-    Wikipedia's table is maintained by editors and reflects index changes
-    (additions/deletions) within days. Dots in tickers are replaced with
-    hyphens to match yfinance format (e.g. BRK.B → BRK-B).
-
-    Falls back to a compact hardcoded list if the fetch fails.
+    Download a Wikipedia S&P 500/400/600 constituent-list page and extract
+    the Symbol column from its main table. Picks the largest table that has
+    a Symbol column (the constituent table), so it's resilient to Wikipedia
+    adding/removing unrelated smaller tables (e.g. "Selected changes" logs
+    don't have a Symbol column and won't be mistaken for the main list).
     """
-    # Check cache first
-    if os.path.exists(_SP500_CACHE_FILE):
+    import requests as _req
+    import io as _io
+
+    headers = {"User-Agent": "Mozilla/5.0 (compatible; nalanda-screener/1.0)"}
+    resp = _req.get(url, headers=headers, timeout=25)
+    resp.raise_for_status()
+
+    tables = pd.read_html(_io.StringIO(resp.text))
+    best_syms, best_n = [], 0
+    for t in tables:
+        if "Symbol" not in t.columns:
+            continue
+        syms = [_normalize_yf_ticker(s) for s in t["Symbol"].dropna()]
+        syms = [s for s in syms if s]
+        if len(syms) > best_n:
+            best_syms, best_n = syms, len(syms)
+
+    if best_n < 90:
+        raise ValueError(f"{name}: no usable Symbol table found (best had {best_n} rows)")
+
+    seen, out = set(), []
+    for s in best_syms:
+        if s not in seen:
+            seen.add(s)
+            out.append(s)
+    return out
+
+
+def get_sp1500_tickers():
+    """
+    Real S&P Composite 1500 constituents, cached up to _SP1500_CACHE_DAYS.
+    Union of Wikipedia's S&P 500 + S&P MidCap 400 + S&P SmallCap 600
+    constituent lists. Falls back to the compact built-in list if all three
+    fetches fail or the result looks too small to be trustworthy (sanity
+    floor: 1200 names — the real S&P 1500 is ~1,500-1,510 names given a
+    handful of dual share classes).
+    """
+    if os.path.exists(_SP1500_CACHE_FILE):
         try:
-            with open(_SP500_CACHE_FILE) as f:
+            with open(_SP1500_CACHE_FILE) as f:
                 cached = json.load(f)
             cached_date = date.fromisoformat(cached["date"])
-            if (date.today() - cached_date).days < _SP500_CACHE_DAYS:
+            if (date.today() - cached_date).days < _SP1500_CACHE_DAYS:
                 return cached["tickers"]
         except Exception:
             pass
 
-    print(f"  {Fore.CYAN}Fetching live S&P 500 list from Wikipedia...", end=" ", flush=True)
-    try:
-        import requests as _req
-        url     = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
-        headers = {"User-Agent": "Mozilla/5.0 (compatible; nalanda-screener/1.0)"}
-        resp    = _req.get(url, headers=headers, timeout=15)
-        resp.raise_for_status()
-        import io
-        tables  = pd.read_html(io.StringIO(resp.text), attrs={"id": "constituents"})
-        tickers = (
-            tables[0]["Symbol"]
-            .str.replace(".", "-", regex=False)
-            .str.strip()
-            .tolist()
+    print(f"  {Fore.CYAN}Fetching S&P 1500 (Wikipedia S&P 500 + 400 + 600)...")
+    all_tickers = set()
+    meta = {}
+    for name, url in _WIKI_SP_INDEX_PAGES.items():
+        print(f"    {name}...", end=" ", flush=True)
+        try:
+            tks = _fetch_wiki_sp_index(name, url)
+            all_tickers |= set(tks)
+            meta[name] = len(tks)
+            print(f"{Fore.GREEN}OK ({len(tks)})")
+        except Exception as e:
+            meta[name] = 0
+            print(f"{Fore.YELLOW}failed ({e})")
+
+    tickers = sorted(all_tickers)
+    if len(tickers) >= 1200:  # real S&P 1500 is ~1500 names; sanity floor
+        with open(_SP1500_CACHE_FILE, "w") as f:
+            json.dump(
+                {"date": date.today().isoformat(), "tickers": tickers, "meta": meta}, f
+            )
+        print(
+            f"  {Fore.GREEN}OK — {len(tickers)} tickers "
+            f"(SP500 {meta.get('SP500',0)}, SP400 {meta.get('SP400',0)}, SP600 {meta.get('SP600',0)})"
+            f"{Style.RESET_ALL}"
         )
-        # Deduplicate while preserving order
-        seen_t = set()
-        tickers = [t for t in tickers if not (t in seen_t or seen_t.add(t))]
-
-        # Save cache
-        with open(_SP500_CACHE_FILE, "w") as f:
-            json.dump({"date": date.today().isoformat(), "tickers": tickers}, f)
-
-        print(f"{Fore.GREEN}OK ({len(tickers)} stocks)")
         return tickers
 
-    except Exception as e:
-        print(f"{Fore.YELLOW}failed ({e}) — using built-in fallback list")
-        return _SP500_FALLBACK
+    print(f"  {Fore.YELLOW}weak result ({len(tickers)}) — using built-in fallback list")
+    return _SP500_FALLBACK
 
 
 # Compact fallback used only when Wikipedia is unreachable
@@ -207,7 +283,9 @@ _SP500_FALLBACK = [
     "ZTS","FICO","VEEV",
 ]
 
-SP500_DEDUP = get_sp500_tickers()
+# Full scan list (legacy name SP500_DEDUP kept for minimal churn in main loop)
+SCAN_UNIVERSE_DEDUP = get_sp1500_tickers()
+SP500_DEDUP = SCAN_UNIVERSE_DEDUP
 
 # ── YFINANCE DATA FETCH ───────────────────────────────────────────────────────
 def _fs_val(df, col, names):
@@ -410,9 +488,10 @@ def _fetch_bond_yield():
     Fetch US 10-year Treasury yield from ^TNX (quoted in %, e.g. 4.35).
     Cached after first call so it is only fetched once per run.
     Falls back to 4.5% if unavailable.
+    Returns (yield_decimal, source_label, reliability_label).
     """
     if "val" in _BOND_YIELD_CACHE:
-        return _BOND_YIELD_CACHE["val"]
+        return _BOND_YIELD_CACHE["val"], _BOND_YIELD_CACHE["source"], _BOND_YIELD_CACHE["reliability"]
     try:
         tnx  = yf.Ticker("^TNX")
         info = tnx.fast_info
@@ -420,11 +499,22 @@ def _fetch_bond_yield():
         if raw is None:
             info2 = tnx.info
             raw   = info2.get("regularMarketPrice") or info2.get("previousClose") or 0
-        val = float(raw) / 100 if raw else 0.045
+        if raw:
+            val = float(raw) / 100
+            source = "^TNX market feed"
+            reliability = "Mostly reliable"
+        else:
+            val = 0.045
+            source = "Static fallback (4.5%)"
+            reliability = "Unreliable"
     except Exception:
         val = 0.045
+        source = "Static fallback (4.5%)"
+        reliability = "Unreliable"
     _BOND_YIELD_CACHE["val"] = val
-    return val
+    _BOND_YIELD_CACHE["source"] = source
+    _BOND_YIELD_CACHE["reliability"] = reliability
+    return val, source, reliability
 
 
 def _calc_hist_pe_median(t, info):
@@ -610,10 +700,17 @@ def _calc_hist_ev_fcf_median(t, info):
 
 def _calc_technical(t, price):
     """
-    RSI(14) and 200-day SMA from daily history. Used for Phase 4 entry checklist.
-    Returns dict: rsi14, sma200, priceVsSma200 ("below" | "above" | "—").
+    Technical bundle from daily history:
+      - RSI(14), 200d SMA
+      - Trend regime (EMA8/EMA21/EMA55 + ADX14)
+      - Momentum confirmation (1m/3m/6m returns + volume ratio vs 20d avg)
+    Used for Phase 4 entry checklist and Entry Signal v2.
     """
-    out = {"rsi14": None, "sma200": None, "priceVsSma200": "—"}
+    out = {
+        "rsi14": None, "sma200": None, "priceVsSma200": "—",
+        "ema8": None, "ema21": None, "ema55": None, "adx14": None, "trendRegime": "—",
+        "mom1m": None, "mom3m": None, "mom6m": None, "volRatio20": None, "momentumSignal": "—",
+    }
     try:
         hist = t.history(period="2y", interval="1d")
         if hist is None or hist.empty or len(hist) < 15:
@@ -635,12 +732,97 @@ def _calc_technical(t, price):
             out["sma200"] = round(sma200, 2)
             if price and sma200:
                 out["priceVsSma200"] = "below" if price < sma200 else "above"
+
+        # Trend regime: EMA(8/21/55) + ADX(14)
+        if len(close) >= 60 and {"High", "Low"}.issubset(hist.columns):
+            high = hist["High"].astype(float)
+            low = hist["Low"].astype(float)
+
+            ema8 = close.ewm(span=8, adjust=False).mean().iloc[-1]
+            ema21 = close.ewm(span=21, adjust=False).mean().iloc[-1]
+            ema55 = close.ewm(span=55, adjust=False).mean().iloc[-1]
+            out["ema8"] = round(float(ema8), 2)
+            out["ema21"] = round(float(ema21), 2)
+            out["ema55"] = round(float(ema55), 2)
+
+            up_move = high.diff()
+            down_move = -low.diff()
+            plus_dm = up_move.where((up_move > down_move) & (up_move > 0), 0.0)
+            minus_dm = down_move.where((down_move > up_move) & (down_move > 0), 0.0)
+            tr = pd.concat([
+                (high - low),
+                (high - close.shift(1)).abs(),
+                (low - close.shift(1)).abs(),
+            ], axis=1).max(axis=1)
+            atr14 = tr.rolling(14, min_periods=14).mean()
+            plus_di = 100 * (plus_dm.rolling(14, min_periods=14).mean() / atr14.replace(0, np.nan))
+            minus_di = 100 * (minus_dm.rolling(14, min_periods=14).mean() / atr14.replace(0, np.nan))
+            dx = ((plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, np.nan)) * 100
+            adx14 = dx.rolling(14, min_periods=14).mean().iloc[-1]
+            if not pd.isna(adx14):
+                out["adx14"] = round(float(adx14), 1)
+
+            if ema8 > ema21 > ema55 and (out["adx14"] is not None and out["adx14"] >= 20):
+                out["trendRegime"] = "Bull"
+            elif ema8 < ema21 < ema55 and (out["adx14"] is not None and out["adx14"] >= 20):
+                out["trendRegime"] = "Bear"
+            else:
+                out["trendRegime"] = "Neutral"
+
+        # Momentum + volume confirmation (similar to ai-hedge-fund approach)
+        if len(close) >= 127 and "Volume" in hist.columns:
+            vol = hist["Volume"].astype(float).replace(0, np.nan)
+            mom1 = (close.iloc[-1] / close.iloc[-22]) - 1 if close.iloc[-22] > 0 else np.nan
+            mom3 = (close.iloc[-1] / close.iloc[-64]) - 1 if close.iloc[-64] > 0 else np.nan
+            mom6 = (close.iloc[-1] / close.iloc[-127]) - 1 if close.iloc[-127] > 0 else np.nan
+            vol_ratio = vol.iloc[-1] / vol.rolling(20, min_periods=20).mean().iloc[-1]
+            if not pd.isna(mom1):
+                out["mom1m"] = round(float(mom1) * 100, 1)
+            if not pd.isna(mom3):
+                out["mom3m"] = round(float(mom3) * 100, 1)
+            if not pd.isna(mom6):
+                out["mom6m"] = round(float(mom6) * 100, 1)
+            if not pd.isna(vol_ratio):
+                out["volRatio20"] = round(float(vol_ratio), 2)
+
+            bullish_mom = (
+                out["mom1m"] is not None and out["mom3m"] is not None and out["mom6m"] is not None
+                and out["mom1m"] > 0 and out["mom3m"] > 0 and out["mom6m"] > 0
+            )
+            bearish_mom = (
+                out["mom1m"] is not None and out["mom3m"] is not None and out["mom6m"] is not None
+                and out["mom1m"] < 0 and out["mom3m"] < 0 and out["mom6m"] < 0
+            )
+            vol_ok = out["volRatio20"] is not None and out["volRatio20"] >= 1.0
+
+            if bullish_mom and vol_ok:
+                out["momentumSignal"] = "Bullish Confirmed"
+            elif bearish_mom and vol_ok:
+                out["momentumSignal"] = "Bearish Confirmed"
+            elif bullish_mom:
+                out["momentumSignal"] = "Bullish (weak volume)"
+            elif bearish_mom:
+                out["momentumSignal"] = "Bearish (weak volume)"
+            else:
+                out["momentumSignal"] = "Neutral"
     except Exception:
         pass
     return out
 
 
-def get_yf_data(ticker):
+def _is_yahoo_rate_limit(msg_or_exc):
+    """True if yfinance/Yahoo returned a throttle error (retry candidate)."""
+    s = str(msg_or_exc).lower()
+    if "rate limit" in s or "too many requests" in s:
+        return True
+    try:
+        from yfinance.exceptions import YFRateLimitError
+        return isinstance(msg_or_exc, YFRateLimitError)
+    except ImportError:
+        return False
+
+
+def _get_yf_data_attempt(ticker):
     try:
         t    = yf.Ticker(ticker)
         info = t.info
@@ -657,9 +839,13 @@ def get_yf_data(ticker):
         # Primary ROCE for scoring: prefer TTM from calculated history
         if hist_roce:
             roce_ttm = hist_roce[0][1]
+            roce_source = "Financial statements (annual + TTM estimate)"
+            roce_reliability = "Mostly reliable"
         else:
             op_margin = info.get("operatingMargins", 0) or 0
             roce_ttm  = max(-1.0, min(5.0, op_margin * 1.5))
+            roce_source = "Operating margin proxy fallback"
+            roce_reliability = "Unreliable"
 
         de_raw = info.get("debtToEquity")
         if de_raw is None or de_raw <= 0:
@@ -711,7 +897,7 @@ def get_yf_data(ticker):
         rev_cagr, earn_cagr = _calc_growth(t)
         cfo_quality         = _calc_cfo_quality(t)
         hist_pe_median      = _calc_hist_pe_median(t, info)
-        bond_yield          = _fetch_bond_yield()
+        bond_yield, bond_source, bond_reliability = _fetch_bond_yield()
         hist_ev_fcf_median, hist_ev_fcf_years = _calc_hist_ev_fcf_median(t, info)
 
         km = {
@@ -735,8 +921,19 @@ def get_yf_data(ticker):
             # Valuation (new v8)
             "histPeMedian":               hist_pe_median,     # float or None
             "bondYield10yr":              bond_yield,         # decimal (e.g. 0.043)
+            "bondYieldSource":            bond_source,
+            "bondYieldReliability":       bond_reliability,
             "histEvFcfMedian":            hist_ev_fcf_median, # float or None
             "histEvFcfYears":             hist_ev_fcf_years,  # int
+            # Source reliability metadata
+            "roceSource":                 roce_source,
+            "roceReliability":            roce_reliability,
+            "technicalReliability":       (
+                "Reliable" if (tech.get("rsi14") is not None and tech.get("sma200") is not None) else "Mostly reliable"
+            ),
+            "fundamentalReliability":     (
+                "Mostly reliable" if (rev_cagr is not None and earn_cagr is not None and cfo_quality is not None) else "Unreliable"
+            ),
             # Data quality
             "filingDate":                 filing_date,
             "dataAgeMonths":              data_age_months,
@@ -763,6 +960,16 @@ def get_yf_data(ticker):
             "rsi14":       tech["rsi14"],
             "sma200":      tech["sma200"],
             "priceVsSma200": tech["priceVsSma200"],
+            "ema8":        tech["ema8"],
+            "ema21":       tech["ema21"],
+            "ema55":       tech["ema55"],
+            "adx14":       tech["adx14"],
+            "trendRegime": tech["trendRegime"],
+            "mom1m":       tech["mom1m"],
+            "mom3m":       tech["mom3m"],
+            "mom6m":       tech["mom6m"],
+            "volRatio20":  tech["volRatio20"],
+            "momentumSignal": tech["momentumSignal"],
         }
 
         return km, rat, prof, hist_roce
@@ -771,11 +978,40 @@ def get_yf_data(ticker):
         return {"__err": str(e)}, {}, {}, []
 
 
+def get_yf_data(ticker):
+    """Fetch Yahoo data with bounded concurrency + retries on rate limits."""
+    for attempt in range(YF_MAX_RETRIES):
+        with _YF_SEM:
+            km, rat, prof, hist_roce = _get_yf_data_attempt(ticker)
+        if "__err" not in km:
+            return km, rat, prof, hist_roce
+        err = km["__err"]
+        if _is_yahoo_rate_limit(err) and attempt < YF_MAX_RETRIES - 1:
+            time.sleep(YF_RETRY_BASE_SEC * (2 ** attempt))
+            continue
+        return km, rat, prof, hist_roce
+
+
 # ── DEBUG MODE ────────────────────────────────────────────────────────────────
 def run_debug(ticker="MSFT"):
     print(f"\n{Fore.CYAN}DEBUG MODE — {ticker}\n")
+    km, rat, prof, hist_roce = get_yf_data(ticker)
+    if "__err" in km:
+        err = str(km["__err"])
+        if "rate limited" in err.lower() or "too many requests" in err.lower():
+            print(f"{Fore.YELLOW}Yahoo rate limited this request. Wait a bit and retry.")
+            print(f"{Fore.YELLOW}Tip: lower concurrency, e.g. NALANDA_WORKERS=4")
+        else:
+            print(f"{Fore.RED}Error: {err}")
+        sys.exit(1)
+
+    # Keep debug dump shape by rebuilding from the same yfinance call path.
     t    = yf.Ticker(ticker)
-    info = t.info
+    info = {}
+    try:
+        info = t.info or {}
+    except Exception:
+        info = {}
 
     print(f"{'='*60}")
     print(f"  yfinance Ticker.info  ({ticker})")
@@ -784,61 +1020,58 @@ def run_debug(ticker="MSFT"):
         if v not in (None, "", 0, 0.0, [], {}):
             print(f"  {k:<45} {v}")
 
-    km, rat, prof, hist_roce = get_yf_data(ticker)
-    if "__err" in km:
-        print(f"\n  {Fore.RED}Error: {km['__err']}")
-    else:
-        print(f"\n{Fore.CYAN}  --- Nalanda metrics (v8) ---")
-        filing     = km.get("filingDate", "unknown")
-        age        = km.get("dataAgeMonths", 99)
-        stale      = km.get("isStale", False)
-        stale_warn = f"  {Fore.YELLOW}⚠ STALE DATA" if stale else f"  {Fore.GREEN}✓ Fresh"
+    print(f"\n{Fore.CYAN}  --- Nalanda metrics (v8) ---")
+    filing     = km.get("filingDate", "unknown")
+    age        = km.get("dataAgeMonths", 99)
+    stale      = km.get("isStale", False)
+    stale_warn = f"  {Fore.YELLOW}⚠ STALE DATA" if stale else f"  {Fore.GREEN}✓ Fresh"
 
-        print(f"  ROCE = EBIT / (Total Assets - Current Liabilities)  [pre-tax]")
-        print(f"  Latest filing: {filing}  ({age}mo old){stale_warn}")
-        for lbl, r in hist_roce:
-            src = "(TTM est.)" if lbl == "TTM" else "(annual)"
-            print(f"    {lbl:<6} {r*100:6.1f}%  {src}")
-        if not hist_roce:
-            print(f"    fallback  {km.get('returnOnCapitalEmployedTTM',0)*100:.1f}%")
+    print(f"  ROCE = EBIT / (Total Assets - Current Liabilities)  [pre-tax]")
+    print(f"  Latest filing: {filing}  ({age}mo old){stale_warn}")
+    for lbl, r in hist_roce:
+        src = "(TTM est.)" if lbl == "TTM" else "(annual)"
+        print(f"    {lbl:<6} {r*100:6.1f}%  {src}")
+    if not hist_roce:
+        print(f"    fallback  {km.get('returnOnCapitalEmployedTTM',0)*100:.1f}%")
 
-        # Growth
-        rev_cagr  = km.get("revenueCagr")
-        earn_cagr = km.get("earningsCagr")
-        cfo_ratio = km.get("cfoQualityRatio")
-        print(f"\n  Revenue CAGR     {f'{rev_cagr*100:.1f}%' if rev_cagr  is not None else '—'}")
-        print(f"  Earnings CAGR    {f'{earn_cagr*100:.1f}%' if earn_cagr is not None else '—'}")
-        print(f"  CFO / Net Income {f'{cfo_ratio:.2f}x'     if cfo_ratio is not None else '—'}")
+    # Growth
+    rev_cagr  = km.get("revenueCagr")
+    earn_cagr = km.get("earningsCagr")
+    cfo_ratio = km.get("cfoQualityRatio")
+    print(f"\n  Revenue CAGR     {f'{rev_cagr*100:.1f}%' if rev_cagr  is not None else '—'}")
+    print(f"  Earnings CAGR    {f'{earn_cagr*100:.1f}%' if earn_cagr is not None else '—'}")
+    print(f"  CFO / Net Income {f'{cfo_ratio:.2f}x'     if cfo_ratio is not None else '—'}")
 
-        # Valuation
-        pe         = rat.get("priceToEarningsRatioTTM", 0)
-        hist_pe    = km.get("histPeMedian")
-        bond_yield = km.get("bondYield10yr", 0.045)
-        earn_yield = (1 / pe * 100) if pe > 1 else 0
-        print(f"\n  P/E TTM          {pe:.1f}x")
-        print(f"  P/E Median (4yr) {f'{hist_pe:.1f}x' if hist_pe else '—'}")
-        print(f"  Earnings Yield   {earn_yield:.1f}%")
-        print(f"  Bond Yield (10y) {bond_yield*100:.1f}%")
-        print(f"  EV/FCF           {km.get('evToFreeCashFlowTTM', 0):.1f}x")
+    # Valuation
+    pe         = rat.get("priceToEarningsRatioTTM", 0)
+    hist_pe    = km.get("histPeMedian")
+    bond_yield = km.get("bondYield10yr", 0.045)
+    earn_yield = (1 / pe * 100) if pe > 1 else 0
+    print(f"\n  P/E TTM          {pe:.1f}x")
+    print(f"  P/E Median (4yr) {f'{hist_pe:.1f}x' if hist_pe else '—'}")
+    print(f"  Earnings Yield   {earn_yield:.1f}%")
+    print(f"  Bond Yield (10y) {bond_yield*100:.1f}%")
+    print(f"  EV/FCF           {km.get('evToFreeCashFlowTTM', 0):.1f}x")
 
-        de   = rat.get("debtToEquityRatioTTM",   0)
-        fcfm = rat.get("fcfMarginTTM",            0) * 100
-        gm   = rat.get("grossProfitMarginTTM",    0) * 100
-        opm  = rat.get("operatingProfitMarginTTM",0) * 100
-        cap  = prof.get("mktCap", 0)
-        print(f"\n  D/E ratio        {de:.2f}x")
-        print(f"  Market Cap       {capmkt(cap)}")
-        print(f"  FCF Margin       {fcfm:.1f}%  [info only]")
-        print(f"  Gross Margin     {gm:.1f}%  [info only]")
-        print(f"  Op Margin        {opm:.1f}%")
-        print(f"  Industry         {prof.get('industry','--')}")
+    de   = rat.get("debtToEquityRatioTTM",   0)
+    fcfm = rat.get("fcfMarginTTM",            0) * 100
+    gm   = rat.get("grossProfitMarginTTM",    0) * 100
+    opm  = rat.get("operatingProfitMarginTTM",0) * 100
+    cap  = prof.get("mktCap", 0)
+    print(f"\n  D/E ratio        {de:.2f}x")
+    print(f"  Market Cap       {capmkt(cap)}")
+    print(f"  FCF Margin       {fcfm:.1f}%  [info only]")
+    print(f"  Gross Margin     {gm:.1f}%  [info only]")
+    print(f"  Op Margin        {opm:.1f}%")
+    print(f"  Industry         {prof.get('industry','--')}")
 
-        score, verdict, tags, det = nalanda_score(km, rat, prof, hist_roce)
-        print(f"\n  Score: {score}/100  →  {verdict}")
-        if tags: print(f"  Tags : {', '.join(tags)}")
-        print(f"\n  Score breakdown:")
-        for k, v in det.items():
-            print(f"    {k:<25} {v}")
+    score, verdict, tags, det = nalanda_score(km, rat, prof, hist_roce)
+    print(f"\n  Nalanda Score: {score}/100  →  Nalanda Verdict: {verdict}")
+    if tags: print(f"  Tags : {', '.join(tags)}")
+    print(f"  Data Reliability {det.get('Data Reliability', '—')}")
+    print(f"\n  Score breakdown:")
+    for k, v in det.items():
+        print(f"    {k:<25} {v}")
 
     print(f"\n{Fore.GREEN}Debug complete.")
     sys.exit(0)
@@ -938,6 +1171,7 @@ def nalanda_score(km, rat, prof, hist_roce=None):
 
     score += hist_pts
     details["ROCE Consistency"] = f"{hist_pts}pts — {hist_note}"
+    details["Source (ROCE)"] = f"{km.get('roceSource', '—')} [{km.get('roceReliability', '—')}]"
 
     # ══ FILTER 2: BALANCE SHEET / DEBT — 20 pts ════════════════════════════════
     # Prasad: "Detesting Debt" — near-binary. D/E > 1x is near-disqualifying.
@@ -1045,6 +1279,7 @@ def nalanda_score(km, rat, prof, hist_roce=None):
     details["Earnings Yield"]    = f"{earn_yield*100:.1f}%" if earn_yield > 0 else "—"
     details["Bond Yield (10yr)"] = f"{bond_yield*100:.1f}%"
     details["EV/FCF"]            = f"{evcf:.1f}x"         if evcf > 0        else "—"
+    details["Source (Bond 10Y)"] = f"{km.get('bondYieldSource', '—')} [{km.get('bondYieldReliability', '—')}]"
 
     if roce_ttm >= 20 and pe > 1:
         pe_below_median  = bool(hist_pe_med) and pe < hist_pe_med
@@ -1264,11 +1499,83 @@ def nalanda_score(km, rat, prof, hist_roce=None):
     rsi14 = prof.get("rsi14")
     sma200 = prof.get("sma200")
     price_vs_sma = prof.get("priceVsSma200") or "—"
+    ema8 = prof.get("ema8")
+    ema21 = prof.get("ema21")
+    ema55 = prof.get("ema55")
+    adx14 = prof.get("adx14")
+    trend_regime = prof.get("trendRegime") or "—"
+    mom1m = prof.get("mom1m")
+    mom3m = prof.get("mom3m")
+    mom6m = prof.get("mom6m")
+    vol_ratio20 = prof.get("volRatio20")
+    momentum_signal = prof.get("momentumSignal") or "—"
     technical_ready = (rsi14 is not None and sma200 is not None and rsi14 < RSI_OVERSOLD and price_vs_sma == "below")
     details["RSI(14)"] = f"{rsi14:.1f}" if rsi14 is not None else "—"
     details["200d SMA"] = f"${sma200:.2f}" if sma200 is not None else "—"
     details["Price vs 200d SMA"] = price_vs_sma
     details["Technical"] = "Ready" if technical_ready else ("Not yet" if (rsi14 is not None or sma200 is not None) else "—")
+    details["Trend Regime"] = trend_regime
+    details["ADX(14)"] = f"{adx14:.1f}" if adx14 is not None else "—"
+    details["EMA Stack"] = (
+        f"${ema8:.2f} / ${ema21:.2f} / ${ema55:.2f}"
+        if (ema8 is not None and ema21 is not None and ema55 is not None)
+        else "—"
+    )
+    details["Momentum (1m/3m/6m)"] = (
+        f"{mom1m:.1f}% / {mom3m:.1f}% / {mom6m:.1f}%"
+        if (mom1m is not None and mom3m is not None and mom6m is not None)
+        else "—"
+    )
+    details["Volume Ratio (20d)"] = f"{vol_ratio20:.2f}x" if vol_ratio20 is not None else "—"
+    details["Momentum Signal"] = momentum_signal
+
+    # Entry Signal v2: combines mean-reversion setup with trend/momentum confirmation.
+    # This improves timing over RSI-only by checking market regime first.
+    entry_signal_v2 = "Not yet"
+    if technical_ready and trend_regime != "Bear":
+        entry_signal_v2 = "Ready (value pullback)"
+    elif trend_regime == "Bull" and momentum_signal.startswith("Bullish"):
+        entry_signal_v2 = "Watch (trend continuation)"
+    elif trend_regime == "Bear" and momentum_signal.startswith("Bearish"):
+        entry_signal_v2 = "Avoid (downtrend)"
+    details["Entry Signal v2"] = entry_signal_v2
+
+    # Staged entry plan: combine value zone with regime quality.
+    price_now = float(prof.get("price") or 0)
+    entry_price_val = None
+    if price_now > 0 and pe > 1 and bond_yield > 0:
+        eps_ttm = price_now / pe
+        entry_bond = eps_ttm / bond_yield
+        entry_median = (eps_ttm * hist_pe_med) if hist_pe_med else None
+        entry_price_val = min(entry_bond, entry_median) if entry_median is not None else entry_bond
+
+    in_value_zone = False
+    if entry_price_val is not None and price_now > 0 and price_now <= entry_price_val:
+        in_value_zone = True
+    if not in_value_zone and fcf_fv_low is not None and price_now > 0 and price_now <= fcf_fv_low * 1.10:
+        in_value_zone = True
+    is_expensive = (
+        (entry_price_val is not None and price_now > entry_price_val * 1.20)
+        or (fcf_fv_high is not None and price_now > fcf_fv_high * 1.10)
+    )
+
+    entry_plan = "Wait"
+    if is_expensive:
+        if trend_regime == "Bull":
+            entry_plan = "Wait (Bull but expensive - no chase)"
+        elif trend_regime == "Bear":
+            entry_plan = "Wait (Bear trend + expensive)"
+        else:
+            entry_plan = "Wait (expensive - no chase)"
+    elif in_value_zone and entry_signal_v2.startswith("Ready"):
+        entry_plan = "Full (add final tranche)"
+    elif in_value_zone and (entry_signal_v2.startswith("Watch") or trend_regime in {"Neutral", "Bull"}):
+        entry_plan = "Scale (add ~35%)"
+    elif in_value_zone and entry_signal_v2.startswith("Avoid"):
+        entry_plan = "Starter (add ~25%, downtrend risk)"
+    elif not in_value_zone and entry_signal_v2.startswith("Watch"):
+        entry_plan = "Wait (watch pullback into value zone)"
+    details["Entry Plan"] = entry_plan
 
     # ══ DATA QUALITY ════════════════════════════════════════════════════════════
     if km.get("isStale"):
@@ -1278,6 +1585,21 @@ def nalanda_score(km, rat, prof, hist_roce=None):
     else:
         details["Data Quality"] = (f"✓ Filing {km.get('filingDate','?')} "
                                    f"({km.get('dataAgeMonths','?')}mo old)")
+
+    reliability_notes = []
+    if km.get("roceReliability") == "Unreliable":
+        reliability_notes.append("ROCE is proxy-derived (operating margin fallback)")
+    if km.get("fundamentalReliability") == "Unreliable":
+        reliability_notes.append("Growth/CFO inputs incomplete from free statements")
+    if km.get("bondYieldReliability") == "Unreliable":
+        reliability_notes.append("10Y bond yield using static fallback (4.5%)")
+    if km.get("technicalReliability") != "Reliable":
+        reliability_notes.append("Technical set partially available (missing RSI or 200d SMA)")
+    details["Data Reliability"] = (
+        "✓ No major reliability flags"
+        if not reliability_notes
+        else f"⚠ {'; '.join(reliability_notes)}"
+    )
 
     score = max(0, min(100, score))
 
@@ -1314,9 +1636,10 @@ def capmkt(v):
 
 # ── HTML REPORT ───────────────────────────────────────────────────────────────
 def write_html(df, path, run_time, n_scanned):
-    strong = len(df[df.Verdict == "STRONG PASS"])
-    passed = len(df[df.Verdict == "PASS"])
-    watch  = len(df[df.Verdict == "WATCH"])
+    verdict_col = "NalandaVerdict" if "NalandaVerdict" in df.columns else "Verdict"
+    strong = len(df[df[verdict_col] == "STRONG PASS"])
+    passed = len(df[df[verdict_col] == "PASS"])
+    watch  = len(df[df[verdict_col] == "WATCH"])
 
     jsd = {}
     for r in df.itertuples():
@@ -1324,10 +1647,15 @@ def write_html(df, path, run_time, n_scanned):
 
     rows = ""
     for i, (_, r) in enumerate(df.iterrows()):
-        sc  = "#34d399" if r.Score >= 78 else "#fbbf24" if r.Score >= 62 else "#fb923c"
-        vc  = {"STRONG PASS":"#34d399","PASS":"#a3e635","WATCH":"#fbbf24"}.get(r.Verdict,"#94a3b8")
+        rd = r.to_dict()
+        try:
+            score_v = int(float(rd.get("NalandaScore", rd.get("Score", 0))))
+        except (TypeError, ValueError):
+            score_v = 0
+        verdict_v = rd.get("NalandaVerdict", rd.get("Verdict", "WATCH"))
+        sc  = "#34d399" if score_v >= 78 else "#fbbf24" if score_v >= 62 else "#fb923c"
+        vc  = {"STRONG PASS":"#34d399","PASS":"#a3e635","WATCH":"#fbbf24"}.get(verdict_v,"#94a3b8")
         bg  = "#0f172a" if i % 2 == 0 else "#0a1220"
-        rd  = r.to_dict()
         tgs = " ".join(
             f"<span style='background:#1e3a2f;color:#6ee7b7;border:1px solid #065f46;"
             f"border-radius:999px;padding:1px 8px;font-size:10px'>{t}</span>"
@@ -1356,14 +1684,16 @@ def write_html(df, path, run_time, n_scanned):
             f"<td style='color:#64748b'>{r.MktCap}</td>"
             f"<td><div style='display:flex;align-items:center;gap:5px'>"
             f"<div style='width:55px;height:4px;background:#1e293b;border-radius:2px;overflow:hidden'>"
-            f"<div style='width:{r.Score}%;height:100%;background:{sc}'></div></div>"
-            f"<span style='color:{sc};font-weight:bold;font-size:12px'>{r.Score}</span></div></td>"
-            f"<td style='color:{vc};font-weight:bold;font-size:11px'>{r.Verdict}</td>"
+            f"<div style='width:{score_v}%;height:100%;background:{sc}'></div></div>"
+            f"<span style='color:{sc};font-weight:bold;font-size:12px'>{score_v}</span></div></td>"
+            f"<td style='color:{vc};font-weight:bold;font-size:11px'>{verdict_v}</td>"
+            f"<td style='color:#94a3b8;font-size:11px'>{rd.get('EntrySignalV2','—')}</td>"
+            f"<td style='color:#94a3b8;font-size:11px'>{rd.get('EntryPlan','—')}</td>"
             f"<td>{tgs}</td></tr>"
         )
 
     html = f"""<!DOCTYPE html><html lang='en'><head><meta charset='UTF-8'>
-<title>Nalanda Screener v7 - {date.today()}</title>
+<title>Nalanda Screener v8 - {date.today()}</title>
 <style>
 *{{box-sizing:border-box;margin:0;padding:0}}
 body{{background:#020817;color:#e2e8f0;font-family:'Courier New',Consolas,monospace;font-size:13px;height:100vh;display:flex;flex-direction:column}}
@@ -1399,9 +1729,9 @@ td{{padding:7px 10px;border-bottom:1px solid #0a1220;cursor:pointer;vertical-ali
 </style></head><body>
 <div class='hdr'>
   <div style='font-size:9px;color:#334155;letter-spacing:.35em;text-transform:uppercase;margin-bottom:3px'>Permanent Capital · Nalanda Framework</div>
-  <h1>Nalanda Screener <span style='color:#34d399'>v8 · S&P 500</span></h1>
+  <h1>Nalanda Screener <span style='color:#34d399'>v8 · S&P Composite 1500</span></h1>
   <div class='meta'>Run: {run_time} · Scanned {n_scanned} stocks · yfinance · Not investment advice</div>
-  <div class='note'>ROCE = EBIT / (Total Assets − Current Liabilities) · Valuation: P/E vs 4yr median + earnings yield vs 10yr bond · Growth: ~3-4yr CAGR · Market Cap ≥ $1B</div>
+  <div class='note'>Universe: S&P Composite 1500 (S&P 500 + MidCap 400 + SmallCap 600 union, via Wikipedia) · ROCE = EBIT / (Total Assets − Current Liabilities) · Valuation: P/E vs 4yr median + earnings yield vs 10yr bond · Growth: ~3-4yr CAGR · Market Cap ≥ $1B</div>
   <div class='stats'>
     <div class='stat'><div class='sn' style='color:#34d399'>{strong}</div><div class='sl'>Strong Pass</div></div>
     <div class='stat'><div class='sn' style='color:#a3e635'>{passed}</div><div class='sl'>Pass</div></div>
@@ -1434,7 +1764,11 @@ td{{padding:7px 10px;border-bottom:1px solid #0a1220;cursor:pointer;vertical-ali
       <th onclick='st(13)' title='Phase 1 quality filter'>Quality</th>
       <th onclick='st(14)' title='FCF Fair Value: Gordon Growth if FCF&lt;NI, else EV/FCF median reversion'>FCF FV</th>
       <th onclick='st(15)'>Mkt Cap</th>
-      <th onclick='st(16)'>Score</th><th onclick='st(17)'>Verdict</th><th>Tags</th>
+      <th onclick='st(16)'>Nalanda Score</th>
+      <th onclick='st(17)'>Nalanda Verdict</th>
+      <th onclick='st(18)' title='Technical overlay only, not Nalanda thesis'>Entry Signal v2</th>
+      <th onclick='st(19)' title='Position sizing overlay only, not Nalanda thesis'>Entry Plan</th>
+      <th>Tags</th>
     </tr></thead>
     <tbody id='tb'>{rows}</tbody>
   </table></div>
@@ -1468,8 +1802,10 @@ function st(c){{
 function sd(t){{
   const d=D[t];if(!d)return;
   const p=document.getElementById('dp');p.classList.add('open');
-  const sc2=parseInt(d.Score)>=78?'#34d399':parseInt(d.Score)>=62?'#fbbf24':'#fb923c';
-  const vc={{'STRONG PASS':'#34d399','PASS':'#a3e635','WATCH':'#fbbf24'}}[d.Verdict]||'#94a3b8';
+  const sRaw = d.NalandaScore ?? d.Score ?? 0;
+  const vRaw = d.NalandaVerdict ?? d.Verdict ?? 'WATCH';
+  const sc2=parseInt(sRaw)>=78?'#34d399':parseInt(sRaw)>=62?'#fbbf24':'#fb923c';
+  const vc={{'STRONG PASS':'#34d399','PASS':'#a3e635','WATCH':'#fbbf24'}}[vRaw]||'#94a3b8';
   const tags=(d.Tags||'').split(', ').filter(Boolean).map(t=>{{
     const warn=t.includes('Volatile')||t.includes('Avoid')||t.includes('Conglomerate')||t.includes('Negative');
     return `<span class='tag ${{warn?"tag-warn":""}}' >${{t}}</span>`;
@@ -1504,8 +1840,8 @@ function sd(t){{
       <div style='color:#334155;font-size:10px'>${{d.Industry}}</div>
     </div>
     <div style='text-align:right'>
-      <div style='color:${{vc}};font-weight:bold;font-size:11px'>${{d.Verdict}}</div>
-      <div style='font-size:26px;font-weight:bold;color:${{sc2}};line-height:1'>${{d.Score}}</div>
+      <div style='color:${{vc}};font-weight:bold;font-size:11px'>${{vRaw}}</div>
+      <div style='font-size:26px;font-weight:bold;color:${{sc2}};line-height:1'>${{sRaw}}</div>
       <div style='color:#475569;font-size:10px'>/100</div>
     </div>
   </div>
@@ -1571,6 +1907,10 @@ function sd(t){{
     <div class='mc'><div class='ml'>Price vs 200d SMA</div><div class='mv-sm'>${{d.PriceVsSma200||'—'}}</div></div>
     <div class='mc'><div class='ml'>Technical</div><div class='mv-sm' style='color:${{d.TechnicalReady==="Ready"?"#34d399":"#94a3b8"}}'>${{d.TechnicalReady||'—'}}</div></div>
   </div>
+  <div class='mg'>
+    <div class='mc'><div class='ml'>Entry Signal v2</div><div class='mv-sm'>${{d.EntrySignalV2||'—'}}</div></div>
+    <div class='mc'><div class='ml'>Entry Plan</div><div class='mv-sm'>${{d.EntryPlan||'—'}}</div></div>
+  </div>
 
   <div class='divider'><div class='info-label'>Balance Sheet</div></div>
   <div class='mg'>
@@ -1630,7 +1970,8 @@ def save_master(new_df, master_df):
     else:
         old      = master_df[~master_df.Ticker.isin(new_df.Ticker)]
         combined = pd.concat([old, new_df], ignore_index=True)
-    combined = combined.sort_values("Score", ascending=False).reset_index(drop=True)
+    sort_col = "NalandaScore" if "NalandaScore" in combined.columns else "Score"
+    combined = combined.sort_values(sort_col, ascending=False).reset_index(drop=True)
     combined.to_csv(MASTER_CSV, index=False)
     return combined
 
@@ -1646,7 +1987,7 @@ def run_entry(ticker):
     print(f"\n{Fore.CYAN}{'='*60}")
     print(f"  Nalanda Entry Checklist — {ticker.upper()}")
     print(f"{'='*60}{Style.RESET_ALL}\n")
-    print(f"  Score: {score}/100  →  {verdict}")
+    print(f"  Nalanda Score: {score}/100  →  Nalanda Verdict: {verdict}")
     print(f"  Tags: {', '.join(tags)}\n")
     print(f"  {Fore.CYAN}Phase 1: Quality Filter{Style.RESET_ALL}")
     print(f"    ROCE > 20%:      {det.get('ROCE TTM','—')}")
@@ -1668,9 +2009,141 @@ def run_entry(ticker):
     print(f"    RSI(14):        {det.get('RSI(14)','—')}")
     print(f"    200d SMA:       {det.get('200d SMA','—')}")
     print(f"    Price vs SMA:   {det.get('Price vs 200d SMA','—')}")
+    print(f"    Trend Regime:   {det.get('Trend Regime','—')} (ADX {det.get('ADX(14)','—')})")
+    print(f"    Momentum:       {det.get('Momentum (1m/3m/6m)','—')}")
+    print(f"    Volume Ratio:   {det.get('Volume Ratio (20d)','—')}")
+    print(f"    Momentum Sig:   {det.get('Momentum Signal','—')}")
     print(f"    Technical:      {det.get('Technical','—')}")
+    print(f"    Entry Signal:   {det.get('Entry Signal v2','—')}")
+    print(f"    Entry Plan:     {det.get('Entry Plan','—')}")
     print(f"\n  Current price: ${prof.get('price', 0):.2f}")
     print(f"  Execute when RSI < 35 and price approaches FCF Fair Value.\n")
+
+
+def _scan_one_ticker(ticker):
+    """
+    Fetch + score one ticker.
+    Returns a dict with:
+      ticker, err, verdict, score, row, entry_signal, entry_plan
+    """
+    km, rat, prof, hist_roce = get_yf_data(ticker)
+    if "__err" in km:
+        return {
+            "ticker": ticker,
+            "err": km["__err"],
+            "verdict": None,
+            "score": None,
+            "row": None,
+            "entry_signal": "—",
+            "entry_plan": "—",
+        }
+
+    score, verdict, tags, det = nalanda_score(km, rat, prof, hist_roce)
+    entry_signal = det.get("Entry Signal v2", "—")
+    entry_plan = det.get("Entry Plan", "—")
+
+    if verdict == "FAIL":
+        return {
+            "ticker": ticker,
+            "err": None,
+            "verdict": verdict,
+            "score": score,
+            "row": None,
+            "entry_signal": entry_signal,
+            "entry_plan": entry_plan,
+        }
+
+    cap  = prof.get("mktCap") or 0
+    opm  = safe(rat, "operatingProfitMarginTTM") * 100
+    npm  = safe(rat, "netProfitMarginTTM")        * 100
+    fcfm = safe(rat, "fcfMarginTTM")              * 100
+    gm   = safe(rat, "grossProfitMarginTTM")      * 100
+
+    # ROCE avg from history (for table display)
+    fy_only  = [(yr, r) for yr, r in (hist_roce or []) if yr != "TTM"]
+    roce_avg = ""
+    if fy_only:
+        avg = sum(r for _, r in fy_only) / len(fy_only) * 100
+        roce_avg = f"{avg:.1f}% ({len(fy_only)}yr)"
+
+    # Entry price: level at which both cheapness metrics pass
+    # = min(price at which E/P = bond yield, price at which P/E = median P/E)
+    price_raw = prof.get("price") or 0
+    pe_val    = safe(rat, "priceToEarningsRatioTTM")
+    bond_y    = km.get("bondYield10yr") or 0.045
+    hist_pe   = km.get("histPeMedian")
+    entry_price_str = "—"
+    if price_raw and pe_val > 1 and bond_y > 0:
+        eps_ttm = price_raw / pe_val
+        entry_bond  = eps_ttm / bond_y
+        entry_median = (eps_ttm * hist_pe) if hist_pe else None
+        if entry_median is not None:
+            entry_val = min(entry_bond, entry_median)
+        else:
+            entry_val = entry_bond
+        entry_price_str = f"${entry_val:.2f}"
+
+    row = {
+        "Ticker":      ticker,
+        "Name":        prof.get("companyName", ticker),
+        "Sector":      prof.get("sector",      "--"),
+        "Industry":    prof.get("industry",    "--"),
+        "ROCE":        det["ROCE TTM"],
+        "ROCEAvg":     roce_avg,
+        "DE":          det["D/E"],
+        "RevGrowth":   det.get("Revenue CAGR",  "—"),
+        "EarnGrowth":  det.get("Earnings CAGR", "—"),
+        "CFOQuality":  det.get("CFO / Net Income", "—"),
+        "FCFMargin":   f"{fcfm:.1f}%",
+        "GrossMargin": f"{gm:.1f}%",
+        "OpMargin":    f"{opm:.1f}%",
+        "NetMargin":   f"{npm:.1f}%",
+        "PE":          det.get("P/E TTM", "—"),
+        "PEMedian":    det.get("P/E Median (4yr)", "—"),
+        "EarnYield":   det.get("Earnings Yield", "—"),
+        "BondYield":   det.get("Bond Yield (10yr)", "—"),
+        "Price":       f"${price_raw:.2f}",
+        "EntryPrice":  entry_price_str,
+        "QualityPass": det.get("Quality Pass", "—"),
+        "NetDebtEBITDA": det.get("Net Debt/EBITDA", "—"),
+        "FCFtoNI":     det.get("FCF/NI", "—"),
+        "FCFYield":    det.get("FCF Yield", "—"),
+        "Hurdle":      det.get("Hurdle", "—"),
+        "FCFFloor":    det.get("FCF Floor", "—"),
+        "FCFFairValue": det.get("FCF Fair Value", "—"),
+        "ImpliedGrowth": det.get("Implied Growth", "—"),
+        "SustGrowth":  det.get("Sustainable Growth", "—"),
+        "ReverseDCF":  det.get("Reverse DCF", "—"),
+        "RSI14":       det.get("RSI(14)", "—"),
+        "SMA200":      det.get("200d SMA", "—"),
+        "PriceVsSma200": det.get("Price vs 200d SMA", "—"),
+        "TrendRegime": det.get("Trend Regime", "—"),
+        "ADX14":       det.get("ADX(14)", "—"),
+        "Momentum1236": det.get("Momentum (1m/3m/6m)", "—"),
+        "VolumeRatio20d": det.get("Volume Ratio (20d)", "—"),
+        "MomentumSignal": det.get("Momentum Signal", "—"),
+        "TechnicalReady": det.get("Technical", "—"),
+        "EntrySignalV2": entry_signal,
+        "EntryPlan":   entry_plan,
+        "MktCap":      capmkt(cap),
+        "NalandaScore": score,
+        "NalandaVerdict": verdict,
+        "Score":       score,    # backward compatibility
+        "Verdict":     verdict,  # backward compatibility
+        "Tags":        ", ".join(tags),
+        "ROCEHistory": det.get("ROCE History", ""),
+        "DataQuality": det.get("Data Quality", ""),
+        "DataReliability": det.get("Data Reliability", ""),
+    }
+    return {
+        "ticker": ticker,
+        "err": None,
+        "verdict": verdict,
+        "score": score,
+        "row": row,
+        "entry_signal": entry_signal,
+        "entry_plan": entry_plan,
+    }
 
 
 # ── MAIN ──────────────────────────────────────────────────────────────────────
@@ -1707,124 +2180,85 @@ def main():
 
     print(f"\n{'='*60}")
     print(f"  NALANDA SCREENER v8 (yfinance) — {today}")
+    print(f"  Universe: S&P Composite 1500 (Wikipedia 500+400+600 union, ~{len(SP500_DEDUP)} names)")
     print(f"  ROCE = EBIT / (Total Assets - Current Liabilities)")
     print(f"  Scanned this cycle : {len(scanned_all)}/{len(SP500_DEDUP)} stocks")
     print(f"  Scanning now       : {len(to_scan)} stocks")
+    print(f"  Parallel workers   : {min(MAX_WORKERS, len(to_scan) if to_scan else 1)}")
+    print(
+        f"  Yahoo concurrency  : {YF_CONCURRENCY} (retries={YF_MAX_RETRIES}, base={YF_RETRY_BASE_SEC}s)"
+    )
     print(f"  Master DB (passing): {len(master)} stocks")
     print(f"{'='*60}\n")
 
     results = []
-    for i, ticker in enumerate(to_scan, 1):
-        print(f"  [{i:3d}/{len(to_scan)}] {ticker:<7}", end=" ", flush=True)
+    workers = min(MAX_WORKERS, len(to_scan) if to_scan else 1)
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        fut_map = {ex.submit(_scan_one_ticker, t): t for t in to_scan}
+        for i, fut in enumerate(as_completed(fut_map), 1):
+            ticker = fut_map[fut]
+            print(f"  [{i:3d}/{len(to_scan)}] {ticker:<7}", end=" ", flush=True)
+            try:
+                out = fut.result()
+            except Exception as e:
+                out = {
+                    "ticker": ticker, "err": f"worker error: {e}", "verdict": None,
+                    "score": None, "row": None, "entry_signal": "—", "entry_plan": "—"
+                }
 
-        km, rat, prof, hist_roce = get_yf_data(ticker)
+            if out["err"]:
+                err_s = str(out["err"])
+                if _is_yahoo_rate_limit(err_s):
+                    # Do not mark scanned — retry on a later run after Yahoo cools down.
+                    print(f"{Fore.YELLOW}rate limited (not marked scanned): {err_s[:56]}")
+                else:
+                    scanned_all.add(ticker)
+                    save_scanned(scanned_all)
+                    print(f"{Fore.RED}skip: {err_s[:60]}")
+                if PAUSE > 0:
+                    time.sleep(PAUSE)
+                continue
 
-        # Mark as scanned regardless of outcome
-        scanned_all.add(ticker)
-        save_scanned(scanned_all)
+            scanned_all.add(ticker)
+            save_scanned(scanned_all)
 
-        if "__err" in km:
-            print(f"{Fore.RED}skip: {km['__err'][:60]}")
-            continue
+            score = out["score"]
+            verdict = out["verdict"]
+            if verdict == "FAIL":
+                print(f"{Fore.RED}FAIL ({score})")
+                if PAUSE > 0:
+                    time.sleep(PAUSE)
+                continue
 
-        score, verdict, tags, det = nalanda_score(km, rat, prof, hist_roce)
-
-        if verdict == "FAIL":
-            print(f"{Fore.RED}FAIL ({score})")
-            time.sleep(PAUSE)
-            continue
-
-        cap  = prof.get("mktCap") or 0
-        opm  = safe(rat, "operatingProfitMarginTTM") * 100
-        npm  = safe(rat, "netProfitMarginTTM")        * 100
-        fcfm = safe(rat, "fcfMarginTTM")              * 100
-        gm   = safe(rat, "grossProfitMarginTTM")      * 100
-
-        # ROCE avg from history (for table display)
-        fy_only  = [(yr, r) for yr, r in (hist_roce or []) if yr != "TTM"]
-        roce_avg = ""
-        if fy_only:
-            avg = sum(r for _, r in fy_only) / len(fy_only) * 100
-            roce_avg = f"{avg:.1f}% ({len(fy_only)}yr)"
-
-        # Entry price: level at which both cheapness metrics pass (P/E < median AND earn yield > bond)
-        # = min( price at which E/P = bond yield,  price at which P/E = median P/E )
-        price_raw = prof.get("price") or 0
-        pe_val    = safe(rat, "priceToEarningsRatioTTM")
-        bond_y    = km.get("bondYield10yr") or 0.045
-        hist_pe   = km.get("histPeMedian")
-        entry_price_str = "—"
-        if price_raw and pe_val > 1 and bond_y > 0:
-            eps_ttm = price_raw / pe_val
-            entry_bond  = eps_ttm / bond_y
-            entry_median = (eps_ttm * hist_pe) if hist_pe else None
-            if entry_median is not None:
-                entry_val = min(entry_bond, entry_median)
+            results.append(out["row"])
+            col = Fore.GREEN if score >= 78 else Fore.YELLOW if score >= 62 else Fore.MAGENTA
+            if verdict in ("STRONG PASS", "PASS"):
+                print(
+                    f"{col}{score:3d}  ->  {verdict}  "
+                    f"|  Entry: {out['entry_signal']}  |  Plan: {out['entry_plan']}{Style.RESET_ALL}"
+                )
             else:
-                entry_val = entry_bond
-            entry_price_str = f"${entry_val:.2f}"
-
-        results.append({
-            "Ticker":      ticker,
-            "Name":        prof.get("companyName", ticker),
-            "Sector":      prof.get("sector",      "--"),
-            "Industry":    prof.get("industry",    "--"),
-            "ROCE":        det["ROCE TTM"],
-            "ROCEAvg":     roce_avg,
-            "DE":          det["D/E"],
-            "RevGrowth":   det.get("Revenue CAGR",  "—"),
-            "EarnGrowth":  det.get("Earnings CAGR", "—"),
-            "CFOQuality":  det.get("CFO / Net Income", "—"),
-            "FCFMargin":   f"{fcfm:.1f}%",
-            "GrossMargin": f"{gm:.1f}%",
-            "OpMargin":    f"{opm:.1f}%",
-            "NetMargin":   f"{npm:.1f}%",
-            "PE":          det.get("P/E TTM", "—"),
-            "PEMedian":    det.get("P/E Median (4yr)", "—"),
-            "EarnYield":   det.get("Earnings Yield", "—"),
-            "BondYield":   det.get("Bond Yield (10yr)", "—"),
-            "Price":       f"${price_raw:.2f}",
-            "EntryPrice":  entry_price_str,
-            "QualityPass": det.get("Quality Pass", "—"),
-            "NetDebtEBITDA": det.get("Net Debt/EBITDA", "—"),
-            "FCFtoNI":     det.get("FCF/NI", "—"),
-            "FCFYield":    det.get("FCF Yield", "—"),
-            "Hurdle":      det.get("Hurdle", "—"),
-            "FCFFloor":    det.get("FCF Floor", "—"),
-            "FCFFairValue": det.get("FCF Fair Value", "—"),
-            "ImpliedGrowth": det.get("Implied Growth", "—"),
-            "SustGrowth":  det.get("Sustainable Growth", "—"),
-            "ReverseDCF":  det.get("Reverse DCF", "—"),
-            "RSI14":       det.get("RSI(14)", "—"),
-            "SMA200":      det.get("200d SMA", "—"),
-            "PriceVsSma200": det.get("Price vs 200d SMA", "—"),
-            "TechnicalReady": det.get("Technical", "—"),
-            "MktCap":      capmkt(cap),
-            "Score":       score,
-            "Verdict":     verdict,
-            "Tags":        ", ".join(tags),
-            "ROCEHistory": det.get("ROCE History", ""),
-            "DataQuality": det.get("Data Quality", ""),
-        })
-        col = Fore.GREEN if score >= 78 else Fore.YELLOW if score >= 62 else Fore.MAGENTA
-        print(f"{col}{score:3d}  ->  {verdict}")
-        time.sleep(PAUSE)
+                print(f"{col}{score:3d}  ->  {verdict}{Style.RESET_ALL}")
+            if PAUSE > 0:
+                time.sleep(PAUSE)
 
     if not results and master.empty:
         print(f"\n{Fore.RED}No results.")
         return
 
     new_df = pd.DataFrame(results) if results else pd.DataFrame()
-    df_out = save_master(new_df, master) if not new_df.empty else master.sort_values("Score", ascending=False)
+    sort_col = "NalandaScore" if "NalandaScore" in master.columns else "Score"
+    df_out = save_master(new_df, master) if not new_df.empty else master.sort_values(sort_col, ascending=False)
 
     print(f"\n{'='*60}")
     print(f"{Fore.GREEN}  This run: {len(results)} passed | Master DB: {len(df_out)} total")
     for v, c in [("STRONG PASS", Fore.GREEN), ("PASS", Fore.LIGHTGREEN_EX), ("WATCH", Fore.YELLOW)]:
-        n = len(df_out[df_out.Verdict == v])
+        verdict_col = "NalandaVerdict" if "NalandaVerdict" in df_out.columns else "Verdict"
+        n = len(df_out[df_out[verdict_col] == v])
         if n: print(f"  {c}{v:<14}{Style.RESET_ALL} {n}")
     print(f"{'='*60}\n")
 
-    show_cols = [c for c in ["Ticker","Name","Sector","ROCE","ROCEAvg","DE","RevGrowth","EarnGrowth","CFOQuality","Price","EntryPrice","Score","Verdict"] if c in df_out.columns]
+    show_cols = [c for c in ["Ticker","Name","Sector","ROCE","ROCEAvg","DE","RevGrowth","EarnGrowth","CFOQuality","Price","EntryPrice","NalandaScore","NalandaVerdict","EntrySignalV2","EntryPlan"] if c in df_out.columns]
     if HAS_TAB: print(tabulate(df_out[show_cols].head(40), headers="keys", tablefmt="rounded_outline", showindex=True))
     else:       print(df_out[show_cols].head(40).to_string())
 
